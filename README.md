@@ -43,7 +43,11 @@ Auth files are read from `$XDG_CONFIG_HOME/cli-proxy-api/auths`, falling back to
 
 Saving the Tokenmaxx tab writes `tokenmaxx.service` and `tokenmaxx.timer` under
 `$XDG_CONFIG_HOME/systemd/user`, reloads systemd and enables the timer. The
-service runs `cpaq ping`.
+service waits for `network-online.target`, runs `cpaq ping`, and re-arms the
+timer after every run, so a boot catch-up or a failed run does not break the
+chain. `cpaq ping` retries transport failures (DNS, connect, timeout) up to three
+attempts with short backoff, keeps a whole run inside a two-minute budget, and
+retries the quota snapshot once; HTTP 4xx/5xx responses are not retried.
 
 ## Providers
 

@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -14,7 +14,16 @@ use crate::{
     paths::Paths,
 };
 
+/// Attempts per ping when the transport fails (DNS, connect, timeout).
+const PING_ATTEMPTS: usize = 3;
+/// Backoff before the second and third attempt.
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(6)];
+/// Whole-run budget: retries stop and attempt timeouts shrink once it is spent,
+/// so even a dead network cannot keep the systemd run hanging for long.
+const RUN_BUDGET: Duration = Duration::from_secs(120);
+
 /// A single chat-completion request after credentials have been resolved.
+#[derive(Clone, Copy)]
 struct HttpRequest<'a> {
     url: &'a str,
     authorization: &'a str,
@@ -33,6 +42,78 @@ trait Transport {
     fn post(&self, request: &HttpRequest<'_>) -> Result<Reply, String>;
 }
 
+/// Injectable sleep so retry backoff never slows tests down.
+trait Backoff {
+    fn wait(&self, delay: Duration);
+}
+
+struct ThreadBackoff;
+
+impl Backoff for ThreadBackoff {
+    fn wait(&self, delay: Duration) {
+        std::thread::sleep(delay);
+    }
+}
+
+/// Retry policy for one keep-alive pass.
+#[derive(Clone, Debug)]
+struct Retry {
+    attempts: usize,
+    delays: Vec<Duration>,
+    budget: Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            attempts: PING_ATTEMPTS,
+            delays: RETRY_DELAYS.to_vec(),
+            budget: RUN_BUDGET,
+        }
+    }
+}
+
+/// Everything one keep-alive pass talks to, so tests can replace all of it.
+struct Seams<'a> {
+    transport: &'a dyn Transport,
+    backoff: &'a dyn Backoff,
+    snapshot: &'a dyn Snapshot,
+    retry: Retry,
+}
+
+impl Seams<'_> {
+    /// Sends one ping, retrying transport failures with backoff.
+    ///
+    /// An HTTP status is an answer, not a transport failure, so 4xx/5xx are
+    /// never retried. The per-attempt timeout shrinks with the remaining budget
+    /// to keep the whole pass bounded even when every attempt hangs.
+    fn post(&self, request: &HttpRequest<'_>, deadline: Instant) -> Result<Reply, String> {
+        let mut last = "request failed".to_string();
+        for attempt in 1..=self.retry.attempts.max(1) {
+            // Round up: a budget of 7s must not become a 6s timeout mid-run.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let budget_secs = u64::try_from(remaining.as_millis().div_ceil(1000))
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let attempt_request = HttpRequest {
+                timeout_secs: request.timeout_secs.min(budget_secs),
+                ..*request
+            };
+            match self.transport.post(&attempt_request) {
+                Ok(reply) => return Ok(reply),
+                Err(error) => last = error,
+            }
+            let Some(delay) = self.retry.delays.get(attempt - 1).copied() else {
+                break;
+            };
+            if delay > deadline.saturating_duration_since(Instant::now()) {
+                break;
+            }
+            self.backoff.wait(delay);
+        }
+        Err(last)
+    }
+}
 struct UreqTransport;
 
 impl Transport for UreqTransport {
@@ -142,15 +223,13 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
     let path = log_path(args, paths, config);
     let file = FileSink::open(&path)?;
     let mut sink = Tee(file, StdoutSink);
-    run_with(
-        args,
-        paths,
-        config,
-        &proxy,
-        &UreqTransport,
-        &mut sink,
-        &LiveSnapshot,
-    )
+    let seams = Seams {
+        transport: &UreqTransport,
+        backoff: &ThreadBackoff,
+        snapshot: &LiveSnapshot,
+        retry: Retry::default(),
+    };
+    run_with(args, paths, config, &proxy, &seams, &mut sink)
 }
 
 fn log_path(args: &Args, paths: &Paths, config: &Config) -> PathBuf {
@@ -164,9 +243,8 @@ fn run_with(
     paths: &Paths,
     config: &Config,
     proxy: &ProxyConfig,
-    transport: &dyn Transport,
+    seams: &Seams<'_>,
     sink: &mut dyn LogSink,
-    snapshot: &dyn Snapshot,
 ) -> Result<i32, String> {
     // A missing auth directory is not fatal: the keep-alive still needs its
     // minimum of one ping.
@@ -193,6 +271,7 @@ fn run_with(
     })
     .to_string();
     let model_label = log_value(&model);
+    let deadline = Instant::now() + seams.retry.budget;
 
     let mut succeeded = 0_usize;
     for index in 1..=total {
@@ -204,7 +283,7 @@ fn run_with(
             body: &body,
             timeout_secs: proxy.timeout_secs,
         };
-        let line = match transport.post(&request) {
+        let line = match seams.post(&request, deadline) {
             Ok(reply) if (200..300).contains(&reply.status) => {
                 succeeded += 1;
                 usage_summary(&reply.body).map_or_else(
@@ -228,7 +307,7 @@ fn run_with(
     }
 
     if !args.no_quota {
-        record_snapshot(auth_dir.as_deref(), paths, config, snapshot, sink)?;
+        record_snapshot(auth_dir.as_deref(), paths, config, seams.snapshot, sink)?;
     }
 
     Ok(i32::from(succeeded == 0))
@@ -254,7 +333,7 @@ fn record_snapshot(
     snapshot: &dyn Snapshot,
     sink: &mut dyn LogSink,
 ) -> Result<(), String> {
-    match dir.map(|dir| snapshot.render(dir, paths, config)) {
+    match dir.map(|dir| snapshot_with_retry(dir, paths, config, snapshot)) {
         Some(Ok(text)) => {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
                 sink.write_line(&format!("{} quota| {}", timestamp(), line.trim()))?;
@@ -267,6 +346,19 @@ fn record_snapshot(
         }
     }
     Ok(())
+}
+
+/// Renders the quota snapshot, retrying once: a transient DNS/connect failure
+/// right after boot should not lose the whole snapshot.
+fn snapshot_with_retry(
+    dir: &Path,
+    paths: &Paths,
+    config: &Config,
+    snapshot: &dyn Snapshot,
+) -> Result<String, String> {
+    snapshot
+        .render(dir, paths, config)
+        .or_else(|_| snapshot.render(dir, paths, config))
 }
 
 fn usage_summary(body: &str) -> Option<String> {
@@ -371,22 +463,30 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingBackoff {
+        waits: RefCell<Vec<Duration>>,
+    }
+
+    impl Backoff for RecordingBackoff {
+        fn wait(&self, delay: Duration) {
+            self.waits.borrow_mut().push(delay);
+        }
+    }
+
     struct FixedSnapshot {
-        text: Result<String, String>,
+        results: RefCell<VecDeque<Result<String, String>>>,
         calls: Cell<usize>,
     }
 
     impl FixedSnapshot {
         fn ok(text: &str) -> Self {
-            Self {
-                text: Ok(text.into()),
-                calls: Cell::new(0),
-            }
+            Self::sequence([Ok(text.to_string())])
         }
 
-        fn err(text: &str) -> Self {
+        fn sequence(results: impl IntoIterator<Item = Result<String, String>>) -> Self {
             Self {
-                text: Err(text.into()),
+                results: RefCell::new(results.into_iter().collect()),
                 calls: Cell::new(0),
             }
         }
@@ -395,7 +495,10 @@ mod tests {
     impl Snapshot for FixedSnapshot {
         fn render(&self, _: &Path, _: &Paths, _: &Config) -> Result<String, String> {
             self.calls.set(self.calls.get() + 1);
-            self.text.clone()
+            self.results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Ok(String::new()))
         }
     }
 
@@ -448,8 +551,37 @@ mod tests {
         sink: &mut Capture,
         snapshot: &FixedSnapshot,
     ) -> Result<i32, String> {
+        execute_with(
+            args,
+            paths,
+            config,
+            transport,
+            sink,
+            snapshot,
+            &RecordingBackoff::default(),
+            Retry::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with(
+        args: &Args,
+        paths: &Paths,
+        config: &Config,
+        transport: &FakeTransport,
+        sink: &mut Capture,
+        snapshot: &FixedSnapshot,
+        backoff: &RecordingBackoff,
+        retry: Retry,
+    ) -> Result<i32, String> {
         let proxy = config.proxy_credentials(paths)?;
-        run_with(args, paths, config, &proxy, transport, sink, snapshot)
+        let seams = Seams {
+            transport,
+            backoff,
+            snapshot,
+            retry,
+        };
+        run_with(args, paths, config, &proxy, &seams, sink)
     }
 
     #[test]
@@ -640,12 +772,16 @@ mod tests {
                 .any(|line| line.contains("tokens used 10%"))
         );
 
-        let snapshot = FixedSnapshot::err("raw /secret/path failure");
+        let snapshot = FixedSnapshot::sequence([
+            Err("raw /secret/path failure".into()),
+            Err("raw /secret/path failure".into()),
+        ]);
         let mut sink = Capture::default();
         assert_eq!(
             execute(&args, &paths, &config, &transport, &mut sink, &snapshot).unwrap(),
             0
         );
+        assert_eq!(snapshot.calls.get(), 2, "the snapshot is retried once");
         assert!(
             sink.lines
                 .iter()
@@ -655,6 +791,202 @@ mod tests {
             sink.lines
                 .iter()
                 .all(|line| !line.contains("raw /secret/path"))
+        );
+    }
+
+    #[test]
+    fn transport_failures_retry_with_backoff_then_succeed() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        auth_dir(&paths, &["codex-a.json"]);
+        let config = fixture_config();
+        let mut args = args();
+        args.pings = Some(1);
+        args.no_quota = true;
+        let transport = FakeTransport::with([
+            Err("request failed".into()),
+            Err("request failed".into()),
+            ok_reply(200, "{}"),
+        ]);
+        let snapshot = FixedSnapshot::ok("");
+        let backoff = RecordingBackoff::default();
+        let mut sink = Capture::default();
+
+        let code = execute_with(
+            &args,
+            &paths,
+            &config,
+            &transport,
+            &mut sink,
+            &snapshot,
+            &backoff,
+            Retry::default(),
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(transport.requests(), 3);
+        assert_eq!(
+            *backoff.waits.borrow(),
+            [Duration::from_secs(3), Duration::from_secs(6)]
+        );
+        assert_eq!(sink.lines.len(), 1);
+        assert!(sink.lines[0].contains("ping 1/1"));
+        assert!(sink.lines[0].contains("status=ok"));
+    }
+
+    #[test]
+    fn http_status_errors_are_answers_and_never_retried() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        auth_dir(&paths, &["codex-a.json"]);
+        let config = fixture_config();
+        let mut args = args();
+        args.pings = Some(1);
+        args.no_quota = true;
+        let snapshot = FixedSnapshot::ok("");
+
+        for status in [429, 500, 503] {
+            let transport = FakeTransport::with([ok_reply(status, "secret")]);
+            let backoff = RecordingBackoff::default();
+            let mut sink = Capture::default();
+            let code = execute_with(
+                &args,
+                &paths,
+                &config,
+                &transport,
+                &mut sink,
+                &snapshot,
+                &backoff,
+                Retry::default(),
+            )
+            .unwrap();
+            assert_eq!(code, 1, "http {status} is a failed ping");
+            assert_eq!(transport.requests(), 1, "http {status} must not retry");
+            assert!(backoff.waits.borrow().is_empty());
+            assert!(sink.lines[0].contains(&format!("http={status}")));
+        }
+    }
+
+    #[test]
+    fn exhausted_attempts_report_one_fixed_line() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        auth_dir(&paths, &["codex-a.json"]);
+        let config = fixture_config();
+        let mut args = args();
+        args.pings = Some(1);
+        args.no_quota = true;
+        let transport = FakeTransport::with([
+            Err("secret-cause".into()),
+            Err("secret-cause".into()),
+            Err("secret-cause".into()),
+        ]);
+        let snapshot = FixedSnapshot::ok("");
+        let backoff = RecordingBackoff::default();
+        let mut sink = Capture::default();
+
+        let code = execute_with(
+            &args,
+            &paths,
+            &config,
+            &transport,
+            &mut sink,
+            &snapshot,
+            &backoff,
+            Retry::default(),
+        )
+        .unwrap();
+
+        assert_eq!(code, 1);
+        assert_eq!(transport.requests(), PING_ATTEMPTS);
+        assert_eq!(sink.lines.len(), 1);
+        assert!(sink.lines[0].contains("status=error reason=request-failed"));
+        assert!(!sink.lines[0].contains("secret-cause"));
+    }
+
+    #[test]
+    fn a_spent_budget_stops_retrying_and_shrinks_timeouts() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        auth_dir(&paths, &["codex-a.json"]);
+        let mut config = fixture_config();
+        config.proxy.timeout_secs = 30;
+        let mut args = args();
+        args.pings = Some(1);
+        args.no_quota = true;
+        let snapshot = FixedSnapshot::ok("");
+
+        // No budget left: the first attempt still runs, the retry does not.
+        let transport = FakeTransport::with([Err("request failed".into()), ok_reply(200, "{}")]);
+        let backoff = RecordingBackoff::default();
+        let mut sink = Capture::default();
+        let code = execute_with(
+            &args,
+            &paths,
+            &config,
+            &transport,
+            &mut sink,
+            &snapshot,
+            &backoff,
+            Retry {
+                budget: Duration::ZERO,
+                ..Retry::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(transport.requests(), 1);
+        assert!(backoff.waits.borrow().is_empty());
+        assert_eq!(transport.seen.borrow()[0].timeout_secs, 1);
+
+        // A short budget caps every attempt, keeping the pass bounded.
+        let transport = FakeTransport::default();
+        let backoff = RecordingBackoff::default();
+        let mut sink = Capture::default();
+        execute_with(
+            &args,
+            &paths,
+            &config,
+            &transport,
+            &mut sink,
+            &snapshot,
+            &backoff,
+            Retry {
+                budget: Duration::from_secs(7),
+                ..Retry::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(transport.seen.borrow()[0].timeout_secs, 7);
+    }
+
+    #[test]
+    fn quota_snapshot_retries_once_then_recovers() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        auth_dir(&paths, &["codex-a.json"]);
+        let config = fixture_config();
+        let args = args();
+        let transport = FakeTransport::default();
+        let snapshot =
+            FixedSnapshot::sequence([Err("transient".into()), Ok("● a@example.org — OK".into())]);
+        let mut sink = Capture::default();
+
+        assert_eq!(
+            execute(&args, &paths, &config, &transport, &mut sink, &snapshot).unwrap(),
+            0
+        );
+        assert_eq!(snapshot.calls.get(), 2);
+        assert!(
+            sink.lines
+                .iter()
+                .any(|line| line.contains("quota| ● a@example.org — OK"))
+        );
+        assert!(
+            sink.lines
+                .iter()
+                .all(|line| !line.contains("quota snapshot unavailable"))
         );
     }
 

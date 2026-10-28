@@ -15,6 +15,15 @@ const TIMER_UNIT: &str = "tokenmaxx.timer";
 const SERVICE_UNIT: &str = "tokenmaxx.service";
 const UNKNOWN: &str = "unknown";
 
+/// Re-arms the monotonic `OnUnitInactiveSec` trigger after every run.
+///
+/// A timer-triggered run — above all the `Persistent=true` catch-up after a
+/// boot — can leave the timer without a monotonic elapse, so the chain would
+/// only continue at the next calendar anchor. Restarting the timer recomputes
+/// the elapse from the unit this run is deactivating. `try-restart` keeps a
+/// disabled tokenmaxx disabled: it does nothing while the timer is stopped.
+const REARM: &str = "ExecStopPost=/usr/bin/systemctl --user try-restart tokenmaxx.timer";
+
 /// Runs `systemctl --user` commands; injectable so tests never touch systemd.
 ///
 /// The `Send` bound lets the TUI move a runner into a background refresh thread.
@@ -171,10 +180,13 @@ fn render_service(exec: &str) -> String {
     format!(
         "[Unit]\n\
          Description=tokenmaxx — CLIProxyAPI rate-limit keep-alive (cpaq)\n\
+         Wants=network-online.target\n\
+         After=network-online.target\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={exec} ping\n"
+         ExecStart={exec} ping\n\
+         {REARM}\n"
     )
 }
 
@@ -307,10 +319,13 @@ mod tests {
             service,
             "[Unit]\n\
              Description=tokenmaxx — CLIProxyAPI rate-limit keep-alive (cpaq)\n\
+             Wants=network-online.target\n\
+             After=network-online.target\n\
              \n\
              [Service]\n\
              Type=oneshot\n\
-             ExecStart=/usr/local/bin/cpaq ping\n"
+             ExecStart=/usr/local/bin/cpaq ping\n\
+             ExecStopPost=/usr/bin/systemctl --user try-restart tokenmaxx.timer\n"
         );
         assert_eq!(
             timer,
@@ -369,6 +384,47 @@ mod tests {
         assert!(timer.contains("Description=tokenmaxx keep-alive — anchor 23:45, every 3h (cpaq)"));
         assert!(timer.contains("OnCalendar=*-*-* 23:45:00"));
         assert!(timer.contains("OnUnitInactiveSec=3h"));
+    }
+
+    #[test]
+    fn service_rearms_the_timer_after_every_run_and_waits_for_network() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        let runner = FakeRunner::default();
+
+        apply(
+            &Config::default(),
+            &paths,
+            Path::new("/usr/local/bin/cpaq"),
+            &runner,
+        )
+        .unwrap();
+
+        let (service, timer) = read_units(&paths);
+        assert!(
+            service.contains("\nWants=network-online.target\n"),
+            "{service}"
+        );
+        assert!(
+            service.contains("\nAfter=network-online.target\n"),
+            "{service}"
+        );
+        assert!(
+            service
+                .contains("\nExecStopPost=/usr/bin/systemctl --user try-restart tokenmaxx.timer\n"),
+            "{service}"
+        );
+        // The hook must run while stopping, never instead of the ping itself.
+        assert_eq!(service.matches("ExecStart=").count(), 1);
+        assert!(service.contains("ExecStart=/usr/local/bin/cpaq ping\n"));
+        for field in [
+            "OnCalendar=*-*-* 05:00:00",
+            "OnUnitInactiveSec=5h",
+            "AccuracySec=30s",
+            "Persistent=true",
+        ] {
+            assert!(timer.contains(field), "timer lost {field}: {timer}");
+        }
     }
 
     #[test]
