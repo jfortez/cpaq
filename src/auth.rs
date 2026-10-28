@@ -4,7 +4,10 @@ use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
 };
 use serde_json::{Map, Value};
-use std::{io, path::Path};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Default)]
 pub struct Auth {
@@ -21,20 +24,36 @@ pub trait AuthReader {
     fn read(&self, path: &Path) -> io::Result<String>;
     fn docker_read(&self, container: &str, path: &str) -> Result<String, String>;
 }
-pub struct FileReader;
+pub struct FileReader {
+    socket: PathBuf,
+}
+impl FileReader {
+    /// Reader bound to the Docker socket from `CPA_DOCKER_SOCKET` or the default.
+    pub fn new() -> Self {
+        Self {
+            socket: crate::docker::socket_path(),
+        }
+    }
+    /// Reader bound to an explicit socket path, so tests never touch the real one.
+    pub fn with_socket(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            socket: socket.into(),
+        }
+    }
+}
+impl Default for FileReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl AuthReader for FileReader {
     fn read(&self, path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
+    /// Reads a root-owned file through the Docker Engine API rather than
+    /// spawning `docker exec`, whose CLI child dominated the ping's memory peak.
     fn docker_read(&self, container: &str, path: &str) -> Result<String, String> {
-        let output = std::process::Command::new("docker")
-            .args(["exec", container, "cat", path])
-            .output()
-            .map_err(|_| "Cannot run docker exec".to_string())?;
-        if !output.status.success() {
-            return Err("docker exec failed; check container and auth permissions".into());
-        }
-        String::from_utf8(output.stdout).map_err(|_| "Auth file is not UTF-8".into())
+        crate::docker::read_file(&self.socket, container, path)
     }
 }
 
@@ -273,7 +292,7 @@ mod tests {
         std::fs::write(s.0.join("notes.txt"), "{}").unwrap();
         std::fs::create_dir(s.0.join("codex-c.json")).unwrap();
         let paths = Paths::new(s.0.clone(), None, None);
-        let auths = load(&s.0, &paths, &FileReader).unwrap();
+        let auths = load(&s.0, &paths, &FileReader::default()).unwrap();
         assert_eq!(
             auths.iter().map(|a| a.file.as_str()).collect::<Vec<_>>(),
             ["codex-a.json", "codex-b.json"]
@@ -376,11 +395,11 @@ mod tests {
         let failing = Fake {
             kind: io::ErrorKind::PermissionDenied,
             calls: RefCell::new(vec![]),
-            docker: Err("docker exec failed; retry later"),
+            docker: Err("Docker API request failed; retry later"),
         };
         let auths = load(&s.0, &paths, &failing).unwrap();
         let err = auths[0].error.as_deref().unwrap();
-        assert!(err.contains("docker exec failed"));
+        assert!(err.contains("Docker API request failed"));
         assert!(!err.contains("fixture"));
         assert_eq!(auths[0].provider, "codex");
     }
@@ -388,8 +407,12 @@ mod tests {
     fn missing_auth_dir_errors_while_empty_dir_is_ok() {
         let s = crate::test_support::Sandbox::default();
         let paths = Paths::new(s.0.clone(), None, None);
-        assert!(load(&s.0.join("absent"), &paths, &FileReader).is_err());
-        assert!(load(&s.0, &paths, &FileReader).unwrap().is_empty());
+        assert!(load(&s.0.join("absent"), &paths, &FileReader::default()).is_err());
+        assert!(
+            load(&s.0, &paths, &FileReader::default())
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn malformed_roots_and_field_types_do_not_panic() {
@@ -406,5 +429,53 @@ mod tests {
         assert_eq!(a.email, None);
         assert_eq!(a.access_token, "fixture");
         assert!(a.error.is_none());
+    }
+    #[test]
+    fn permission_denied_reads_the_file_through_the_container_socket() {
+        struct SocketReader(FileReader);
+        impl AuthReader for SocketReader {
+            fn read(&self, _: &Path) -> io::Result<String> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+            fn docker_read(&self, container: &str, path: &str) -> Result<String, String> {
+                self.0.docker_read(container, path)
+            }
+        }
+        let s = crate::test_support::Sandbox::default();
+        std::fs::write(s.0.join("codex-a.json"), "{}").unwrap();
+        let archive = crate::docker::testing::tar_regular(
+            "codex-a.json",
+            br#"{"type":"codex","access_token":"fixture"}"#,
+        );
+        let (socket, server) = crate::docker::testing::serve(
+            &s.0,
+            vec![crate::docker::testing::with_length(&archive)],
+        );
+        let paths = Paths::new(s.0.clone(), None, None);
+
+        let auths = load(&s.0, &paths, &SocketReader(FileReader::with_socket(socket))).unwrap();
+
+        let requests = server.join().unwrap();
+        let request = String::from_utf8(requests[0].clone()).unwrap();
+        assert!(
+            request.starts_with(
+                "GET /v1.41/containers/cli-proxy-api/archive?path=%2Froot%2F.cli-proxy-api%2Fcodex-a.json "
+            ),
+            "{request}"
+        );
+        assert_eq!(auths[0].access_token, "fixture");
+        assert!(auths[0].error.is_none());
+    }
+    #[test]
+    fn socket_failures_are_reported_per_file_without_the_docker_cli() {
+        let s = crate::test_support::Sandbox::default();
+        std::fs::write(s.0.join("codex-a.json"), "{}").unwrap();
+        let reader = FileReader::with_socket(s.0.join("absent.sock"));
+
+        let error = reader
+            .docker_read("cli-proxy-api", "/root/.cli-proxy-api/codex-a.json")
+            .unwrap_err();
+        assert_eq!(error, "Cannot reach the Docker socket");
+        assert!(!error.contains("docker exec"));
     }
 }

@@ -41,6 +41,11 @@ model = "gpt-6-luna"
 Auth files are read from `$XDG_CONFIG_HOME/cli-proxy-api/auths`, falling back to
 `$XDG_CONFIG_HOME/cpa/auths`. Override with `--auth-dir` or `CPA_AUTH_DIR`.
 
+Root-owned auth files are read through the Docker Engine API over
+`/var/run/docker.sock` (override with `CPA_DOCKER_SOCKET`), so no `docker` CLI
+child process is spawned; `CPA_DOCKER_CONTAINER` and `CPA_CONTAINER_AUTH_DIR`
+name the container and the directory inside it.
+
 Saving the Tokenmaxx tab writes `tokenmaxx.service` and `tokenmaxx.timer` under
 `$XDG_CONFIG_HOME/systemd/user`, reloads systemd and enables the timer. The
 service waits for `network-online.target`, runs `cpaq ping`, and re-arms the

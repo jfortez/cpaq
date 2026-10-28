@@ -71,7 +71,7 @@ pub fn fetch(
             dir.display()
         ));
     }
-    let auths = crate::auth::load(dir, paths, &crate::auth::FileReader)?;
+    let auths = crate::auth::load(dir, paths, &crate::auth::FileReader::default())?;
     if auths.is_empty() {
         return Err(format!("No auth files found in {}", dir.display()));
     }
