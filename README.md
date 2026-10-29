@@ -16,11 +16,14 @@ install -m755 target/release/cpaq ~/.local/bin/cpaq
 cpaq                # TUI: Quotas | Tokenmaxx
 cpaq quota          # headless quota report
 cpaq quota --json   # machine-readable output
-cpaq ping           # keep-alive ping (run by the systemd timer)
+cpaq ping           # unconditional keep-alive pass
+cpaq auto           # local due check; ping only when due (systemd timer)
+cpaq auto --dry-run # decision and would-be state, without HTTP or writes
+cpaq units apply    # save config and regenerate/enable the user units
 ```
 
 Keys: `q` quit · `Tab` switch tab · `j`/`k` move · `Enter` details/edit ·
-`r` refresh · `s` save and apply timer · `x` run now · `?` help.
+`r` refresh · `a` toggle auto (saved immediately) · `s` save and apply timer · `x` run now · `?` help.
 
 ## Configuration
 
@@ -33,6 +36,7 @@ api_key = ""        # empty: read ~/.pi/agent/cliproxyapi.json
 
 [tokenmaxx]
 enabled = true
+auto = true       # default, including older configs
 anchor = "05:00"
 interval_hours = 5
 model = "gpt-6-luna"
@@ -48,9 +52,16 @@ name the container and the directory inside it.
 
 Saving the Tokenmaxx tab writes `tokenmaxx.service` and `tokenmaxx.timer` under
 `$XDG_CONFIG_HOME/systemd/user`, reloads systemd and enables the timer. The
-service waits for `network-online.target`, runs `cpaq ping`, and re-arms the
+service waits for `network-online.target`, runs `cpaq auto`, and re-arms the
 timer after every run, so a boot catch-up or a failed run does not break the
-chain. `cpaq ping` retries transport failures (DNS, connect, timeout) up to three
+chain. With `auto = true`, the timer checks every five minutes; local state alone
+controls when to ping. With `auto = false`, the timer retains the configured
+anchor and hourly interval. A boot check runs after 90 seconds. `auto` reads only
+`$XDG_STATE_HOME/tokenmaxx/auto.json` (`~/.local/state/tokenmaxx/auto.json`)
+until due; idle checks do not read auth or contact Docker/providers. State is
+written atomically with mode 0600 after a completed pass, including a failed
+pass; setup errors leave it unchanged. `--json` returns the decision and state;
+ping details still go to the normal log. `cpaq ping` retries transport failures (DNS, connect, timeout) up to three
 attempts with short backoff, keeps a whole run inside a two-minute budget, and
 retries the quota snapshot once; HTTP 4xx/5xx responses are not retried.
 

@@ -52,10 +52,11 @@ pub enum Setting {
     Timer,
     NextRun,
     LastRun,
+    Auto,
 }
 
 impl Setting {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Enabled,
         Self::Anchor,
         Self::Interval,
@@ -65,12 +66,14 @@ impl Setting {
         Self::Timer,
         Self::NextRun,
         Self::LastRun,
+        Self::Auto,
     ];
 
     /// Short label rendered in the settings list.
     pub fn label(self) -> &'static str {
         match self {
             Self::Enabled => "enabled",
+            Self::Auto => "auto",
             Self::Anchor => "anchor",
             Self::Interval => "interval",
             Self::Model => "model",
@@ -86,7 +89,12 @@ impl Setting {
     pub fn editable(self) -> bool {
         matches!(
             self,
-            Self::Enabled | Self::Anchor | Self::Interval | Self::Model | Self::LogPath
+            Self::Enabled
+                | Self::Auto
+                | Self::Anchor
+                | Self::Interval
+                | Self::Model
+                | Self::LogPath
         )
     }
 }
@@ -102,6 +110,7 @@ pub struct EditState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Draft {
     pub enabled: bool,
+    pub auto: bool,
     pub anchor: String,
     pub interval_hours: String,
     pub model: String,
@@ -309,6 +318,10 @@ impl App {
                 Vec::new()
             }
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('a') if self.tab == Tab::Tokenmaxx => {
+                self.toggle_auto();
+                Vec::new()
+            }
             KeyCode::Char('s') if self.tab == Tab::Tokenmaxx => self.request_save(),
             KeyCode::Char('x') if self.tab == Tab::Tokenmaxx => self.request_run_now(),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -447,6 +460,7 @@ impl App {
         let mut config = self.base_config.clone();
         config.tokenmaxx = TokenmaxxConfig {
             enabled: self.tokenmaxx.draft.enabled,
+            auto: self.tokenmaxx.draft.auto,
             anchor: self.tokenmaxx.draft.anchor.trim().to_string(),
             interval_hours,
             model: self.tokenmaxx.draft.model.trim().to_string(),
@@ -461,6 +475,12 @@ impl App {
     pub fn setting_value(&self, setting: Setting) -> String {
         match setting {
             Setting::Enabled => yes_no(self.tokenmaxx.draft.enabled),
+            Setting::Auto => if self.tokenmaxx.draft.auto {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
             Setting::Anchor => self.tokenmaxx.draft.anchor.clone(),
             Setting::Interval => format!("{} h", self.tokenmaxx.draft.interval_hours),
             Setting::Model => self.tokenmaxx.draft.model.clone(),
@@ -535,7 +555,9 @@ impl App {
                     .tokenmaxx
                     .selected
                     .min(Setting::ALL.len().saturating_sub(1))];
-                if setting == Setting::Enabled {
+                if setting == Setting::Auto {
+                    self.toggle_auto();
+                } else if setting == Setting::Enabled {
                     self.tokenmaxx.draft.enabled = !self.tokenmaxx.draft.enabled;
                     self.set_status("Change pending — press s to save", false);
                 } else if setting.editable() {
@@ -545,6 +567,24 @@ impl App {
                 }
                 Vec::new()
             }
+        }
+    }
+
+    fn toggle_auto(&mut self) {
+        if self.tokenmaxx.save_pending {
+            self.set_status("Save/apply already running", true);
+            return;
+        }
+        // Persist only this toggle, leaving unrelated draft edits unsaved.
+        let mut config = self.base_config.clone();
+        config.tokenmaxx.auto = !self.tokenmaxx.draft.auto;
+        match config.save(&self.paths.config_file()) {
+            Ok(()) => {
+                self.tokenmaxx.draft.auto = config.tokenmaxx.auto;
+                self.base_config.tokenmaxx.auto = config.tokenmaxx.auto;
+                self.set_status("Auto saved — press s to re-apply units", false);
+            }
+            Err(error) => self.set_status(error, true),
         }
     }
 
@@ -709,6 +749,7 @@ impl App {
 fn draft_from_config(config: &Config, paths: &Paths) -> Draft {
     Draft {
         enabled: config.tokenmaxx.enabled,
+        auto: config.tokenmaxx.auto,
         anchor: config.tokenmaxx.anchor.clone(),
         interval_hours: config.tokenmaxx.interval_hours.to_string(),
         model: config.tokenmaxx.model.clone(),
@@ -875,6 +916,39 @@ mod tests {
             accounts,
             at: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn auto_key_saves_only_toggle_and_does_not_apply_units() {
+        let sandbox = Sandbox::default();
+        let paths = Paths::new(sandbox.0.clone(), None, None);
+        let mut app = App::new(paths.clone(), Config::default(), Args::default());
+        app.tab = Tab::Tokenmaxx;
+        app.tokenmaxx.draft.model = "unsaved-model".into();
+        assert!(app.handle_key(key(KeyCode::Char('a'))).is_empty());
+        assert!(!Config::load(&paths.config_file()).unwrap().tokenmaxx.auto);
+        assert_eq!(
+            Config::load(&paths.config_file()).unwrap().tokenmaxx.model,
+            Config::default().tokenmaxx.model
+        );
+        assert_eq!(app.tokenmaxx.draft.model, "unsaved-model");
+        assert!(!app.build_config().unwrap().tokenmaxx.auto);
+        assert!(!paths.unit_dir().exists());
+        app.handle_key(key(KeyCode::Char('a')));
+        assert!(Config::load(&paths.config_file()).unwrap().tokenmaxx.auto);
+        assert!(app.build_config().unwrap().tokenmaxx.auto);
+    }
+
+    #[test]
+    fn auto_toggle_save_failure_keeps_previous_value() {
+        let sandbox = Sandbox::default();
+        let paths = Paths::new(sandbox.0.clone(), Some(sandbox.0.join("not-a-dir")), None);
+        std::fs::write(&paths.config_home, "blocked").unwrap();
+        let mut app = App::new(paths, Config::default(), Args::default());
+        app.tab = Tab::Tokenmaxx;
+        app.handle_key(key(KeyCode::Char('a')));
+        assert!(app.status_error);
+        assert!(app.build_config().unwrap().tokenmaxx.auto);
     }
 
     #[test]

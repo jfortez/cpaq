@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod auto;
 pub mod cli;
 pub mod config;
 pub mod docker;

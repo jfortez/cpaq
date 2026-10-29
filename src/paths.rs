@@ -48,6 +48,9 @@ impl Paths {
     pub fn log_file(&self) -> PathBuf {
         self.state_home.join("tokenmaxx/ping.log")
     }
+    pub fn auto_state_file(&self) -> PathBuf {
+        self.state_home.join("tokenmaxx/auto.json")
+    }
     pub fn unit_dir(&self) -> PathBuf {
         self.config_home.join("systemd/user")
     }

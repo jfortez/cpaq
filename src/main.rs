@@ -22,7 +22,17 @@ fn execute(args: Args) -> Result<u8, String> {
     if args.mode == Mode::Ping {
         return cpaq::tokenmaxx::run(&args, &paths, &config).map(|code| code as u8);
     }
-    if args.mode == Mode::Auto && io::stdout().is_terminal() {
+    if args.mode == Mode::Auto {
+        return cpaq::auto::run(&args, &paths, &config).map(|code| code as u8);
+    }
+    if args.mode == Mode::UnitsApply {
+        let executable = std::env::current_exe()
+            .map_err(|_| "Cannot determine cpaq executable path".to_string())?;
+        cpaq::systemd::apply(&config, &paths, &executable, &cpaq::systemd::SystemRunner)?;
+        println!("tokenmaxx: units applied");
+        return Ok(0);
+    }
+    if args.mode == Mode::Default && io::stdout().is_terminal() {
         cpaq::tui::run(paths, config, args)?;
         return Ok(0);
     }

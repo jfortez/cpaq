@@ -219,17 +219,37 @@ impl<A: LogSink, B: LogSink> LogSink for Tee<A, B> {
 /// Returns `0` when at least one ping succeeded and `1` when every ping
 /// failed. Configuration, credential and log-setup failures are errors.
 pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
+    run_output(args, paths, config, true)
+}
+
+/// Runs the existing pass, optionally keeping stdout free for auto JSON.
+pub(crate) fn run_output(
+    args: &Args,
+    paths: &Paths,
+    config: &Config,
+    stdout: bool,
+) -> Result<i32, String> {
     let proxy = config.proxy_credentials(paths)?;
     let path = log_path(args, paths, config);
-    let file = FileSink::open(&path)?;
-    let mut sink = Tee(file, StdoutSink);
+    let mut file = FileSink::open(&path)?;
     let seams = Seams {
         transport: &UreqTransport,
         backoff: &ThreadBackoff,
         snapshot: &LiveSnapshot,
         retry: Retry::default(),
     };
-    run_with(args, paths, config, &proxy, &seams, &mut sink)
+    if stdout {
+        run_with(
+            args,
+            paths,
+            config,
+            &proxy,
+            &seams,
+            &mut Tee(file, StdoutSink),
+        )
+    } else {
+        run_with(args, paths, config, &proxy, &seams, &mut file)
+    }
 }
 
 fn log_path(args: &Args, paths: &Paths, config: &Config) -> PathBuf {

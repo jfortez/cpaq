@@ -136,7 +136,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let line = if app.status.is_empty() {
         Line::from(Span::styled(
-            "q quit · ? help · Tab tabs · j/k move · r refresh · s save/apply · x run now",
+            "q quit · ? help · Tab tabs · j/k move · r refresh · a toggle auto · s save/apply · x run now",
             Style::default().fg(theme::MUTED),
         ))
     } else {
@@ -360,11 +360,10 @@ fn render_tokenmaxx(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let mut state = ListState::default();
         state.select(Some(selected));
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Tokenmaxx settings"),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "Tokenmaxx settings · auto: {} · a toggle auto",
+                app.setting_value(Setting::Auto)
+            )))
             .highlight_style(
                 Style::default()
                     .bg(theme::SELECTED)
@@ -419,6 +418,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("j/k or arrows navigate"),
         Line::raw("Enter or space toggle/edit; Esc cancels"),
         Line::raw("r refresh quotas and timer status"),
+        Line::raw("a toggle auto (saved immediately)"),
         Line::raw("s save & apply tokenmaxx units"),
         Line::raw("x run now (systemctl --user start)"),
         Line::raw("? close this help"),
@@ -568,6 +568,20 @@ mod tests {
             reset_at: Some(json!(1_700_003_600i64)),
             reset_after: Some(3600.0),
         }
+    }
+
+    #[test]
+    fn tokenmaxx_renders_auto_state_and_toggle_key() {
+        let mut app = app_with(Vec::new());
+        app.tab = Tab::Tokenmaxx;
+        assert!(render_text(&app, 120, 30).contains("auto: on"));
+        let mut config = Config::default();
+        config.tokenmaxx.auto = false;
+        let mut app = App::new(test_paths(), config, Args::default());
+        app.tab = Tab::Tokenmaxx;
+        let text = render_text(&app, 120, 30);
+        assert!(text.contains("auto: off"));
+        assert!(text.contains("a toggle auto"));
     }
 
     #[test]

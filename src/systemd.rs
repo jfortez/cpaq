@@ -185,27 +185,42 @@ fn render_service(exec: &str) -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={exec} ping\n\
+         ExecStart={exec} auto\n\
          {REARM}\n"
     )
 }
 
 fn render_timer(config: &Config) -> String {
     let tokenmaxx = &config.tokenmaxx;
+    let (description, schedule) = if tokenmaxx.auto {
+        (
+            "auto check every 5 minutes".to_string(),
+            "OnCalendar=*:0/5".to_string(),
+        )
+    } else {
+        (
+            format!(
+                "anchor {}, every {}h",
+                tokenmaxx.anchor, tokenmaxx.interval_hours
+            ),
+            format!(
+                "OnCalendar=*-*-* {}:00\nOnUnitInactiveSec={}h",
+                tokenmaxx.anchor, tokenmaxx.interval_hours
+            ),
+        )
+    };
     format!(
         "[Unit]\n\
-         Description=tokenmaxx keep-alive — anchor {anchor}, every {interval}h (cpaq)\n\
+         Description=tokenmaxx keep-alive — {description} (cpaq)\n\
          \n\
          [Timer]\n\
-         OnCalendar=*-*-* {anchor}:00\n\
-         OnUnitInactiveSec={interval}h\n\
+         OnBootSec=90s\n\
+         {schedule}\n\
          AccuracySec=30s\n\
          Persistent=true\n\
          \n\
          [Install]\n\
-         WantedBy=timers.target\n",
-        anchor = tokenmaxx.anchor,
-        interval = tokenmaxx.interval_hours,
+         WantedBy=timers.target\n"
     )
 }
 
@@ -324,17 +339,17 @@ mod tests {
              \n\
              [Service]\n\
              Type=oneshot\n\
-             ExecStart=/usr/local/bin/cpaq ping\n\
+             ExecStart=/usr/local/bin/cpaq auto\n\
              ExecStopPost=/usr/bin/systemctl --user try-restart tokenmaxx.timer\n"
         );
         assert_eq!(
             timer,
             "[Unit]\n\
-             Description=tokenmaxx keep-alive — anchor 05:00, every 5h (cpaq)\n\
+             Description=tokenmaxx keep-alive — auto check every 5 minutes (cpaq)\n\
              \n\
              [Timer]\n\
-             OnCalendar=*-*-* 05:00:00\n\
-             OnUnitInactiveSec=5h\n\
+             OnBootSec=90s\n\
+             OnCalendar=*:0/5\n\
              AccuracySec=30s\n\
              Persistent=true\n\
              \n\
@@ -370,11 +385,35 @@ mod tests {
     }
 
     #[test]
-    fn timer_uses_configured_anchor_and_interval() {
+    fn auto_timer_ticks_independently_of_anchor_and_ping_interval() {
         let sandbox = Sandbox::default();
         let paths = sandbox_paths(&sandbox);
         let runner = FakeRunner::default();
         let mut config = Config::default();
+        config.tokenmaxx.anchor = "23:45".into();
+        config.tokenmaxx.interval_hours = 3;
+        apply(&config, &paths, &executable(&sandbox), &runner).unwrap();
+        let (_, timer) = read_units(&paths);
+        assert!(timer.contains("\nOnCalendar=*:0/5\n"));
+        assert_eq!(timer.matches("OnCalendar=").count(), 1);
+        assert!(!timer.contains("OnUnitInactiveSec="));
+        assert!(!timer.contains("23:45"));
+        for field in ["OnBootSec=90s", "AccuracySec=30s", "Persistent=true"] {
+            assert!(timer.contains(field));
+        }
+        assert_eq!(
+            call_names(&runner.calls()),
+            ["daemon-reload", "enable --now tokenmaxx.timer"]
+        );
+    }
+
+    #[test]
+    fn manual_timer_uses_configured_anchor_and_interval() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        let runner = FakeRunner::default();
+        let mut config = Config::default();
+        config.tokenmaxx.auto = false;
         config.tokenmaxx.anchor = "23:45".into();
         config.tokenmaxx.interval_hours = 3;
 
@@ -384,6 +423,10 @@ mod tests {
         assert!(timer.contains("Description=tokenmaxx keep-alive — anchor 23:45, every 3h (cpaq)"));
         assert!(timer.contains("OnCalendar=*-*-* 23:45:00"));
         assert!(timer.contains("OnUnitInactiveSec=3h"));
+        assert!(!timer.contains("OnCalendar=*:0/5"));
+        for field in ["OnBootSec=90s", "AccuracySec=30s", "Persistent=true"] {
+            assert!(timer.contains(field));
+        }
     }
 
     #[test]
@@ -416,10 +459,10 @@ mod tests {
         );
         // The hook must run while stopping, never instead of the ping itself.
         assert_eq!(service.matches("ExecStart=").count(), 1);
-        assert!(service.contains("ExecStart=/usr/local/bin/cpaq ping\n"));
+        assert!(service.contains("ExecStart=/usr/local/bin/cpaq auto\n"));
         for field in [
-            "OnCalendar=*-*-* 05:00:00",
-            "OnUnitInactiveSec=5h",
+            "OnBootSec=90s",
+            "OnCalendar=*:0/5",
             "AccuracySec=30s",
             "Persistent=true",
         ] {
@@ -569,7 +612,7 @@ mod tests {
         .unwrap();
 
         let (service, _) = read_units(&paths);
-        assert!(service.contains("ExecStart=\"/opt/My Tools/100%%/qa\\\"te/cpaq\" ping\n"));
+        assert!(service.contains("ExecStart=\"/opt/My Tools/100%%/qa\\\"te/cpaq\" auto\n"));
     }
 
     #[test]

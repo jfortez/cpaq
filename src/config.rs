@@ -40,16 +40,23 @@ impl Default for ProxyConfig {
 #[serde(default)]
 pub struct TokenmaxxConfig {
     pub enabled: bool,
+    #[serde(default = "default_auto")]
+    pub auto: bool,
     pub anchor: String,
     pub interval_hours: u32,
     pub model: String,
     pub pings_per_account: usize,
     pub log_path: Option<PathBuf>,
 }
+fn default_auto() -> bool {
+    true
+}
+
 impl Default for TokenmaxxConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            auto: default_auto(),
             anchor: "05:00".into(),
             interval_hours: 5,
             model: "gpt-6-luna".into(),
@@ -170,6 +177,28 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::Sandbox;
+    #[test]
+    fn auto_defaults_true_for_missing_legacy_and_empty_config_and_persists_false() {
+        let sandbox = Sandbox::default();
+        let file = sandbox.0.join("config.toml");
+        for config in [
+            Config::load(&file).unwrap(),
+            toml::from_str::<Config>("[tokenmaxx]\nenabled=true").unwrap(),
+        ] {
+            let value: toml::Value = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                value["tokenmaxx"]
+                    .get("auto")
+                    .and_then(toml::Value::as_bool),
+                Some(true)
+            );
+        }
+        let config: Config = toml::from_str("[tokenmaxx]\nauto=false").unwrap();
+        config.save(&file).unwrap();
+        let value: toml::Value =
+            toml::from_str(&toml::to_string(&Config::load(&file).unwrap()).unwrap()).unwrap();
+        assert_eq!(value["tokenmaxx"]["auto"].as_bool(), Some(false));
+    }
     #[test]
     fn config_round_trip_and_private_atomic_save() {
         use std::os::unix::fs::PermissionsExt;
