@@ -59,10 +59,13 @@ controls when to ping. With `auto = false`, the timer retains the configured
 anchor and hourly interval. A boot check runs after 90 seconds. `auto` reads only
 `$XDG_STATE_HOME/tokenmaxx/auto.json` (`~/.local/state/tokenmaxx/auto.json`)
 until due; idle checks do not read auth or contact Docker/providers. State is
-written atomically with mode 0600 after a completed pass, including a failed
-pass; setup errors leave it unchanged. `--json` returns the decision and state;
-ping details still go to the normal log. `cpaq ping` retries transport failures (DNS, connect, timeout) up to three
-attempts with short backoff, keeps a whole run inside a two-minute budget, and
+shared by `ping` and `auto`, written atomically with mode 0600 after at least one
+successful ping; failed passes leave it unchanged. The next due time is the
+earliest Codex 5h reset from the existing quota snapshot, falling back to the
+last ping plus `interval_hours` when unavailable (including `--no-quota`).
+`--json` returns the decision and state; ping details still go to the normal log.
+`cpaq ping` retries transport failures (DNS, connect, timeout) up to three attempts
+with short backoff, keeps a whole run inside a two-minute budget, and
 retries the quota snapshot once; HTTP 4xx/5xx responses are not retried.
 
 ## Providers

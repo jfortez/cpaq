@@ -204,7 +204,13 @@ fn public_ping_posts_to_fake_proxy_and_tees_safe_logs() {
         fs::write(f.0.join("config/cpaq/config.toml"), format!(
             "[proxy]\nbase_url='http://{address}'\napi_key='private-fixture-value'\ntimeout_secs=1\n[tokenmaxx]\nmodel='test-model'\n"
         )).unwrap();
+        let state_path = f.0.join("state/tokenmaxx/auto.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let previous = br#"{"last_ping_epoch":10,"next_due_epoch":20}"#;
+        fs::write(&state_path, previous).unwrap();
+        let before = cpaq::time::now() as u64;
         let output = f.run(&["ping", "--pings", "2", "--no-quota"]);
+        let after = cpaq::time::now() as u64;
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
@@ -222,6 +228,26 @@ fn public_ping_posts_to_fake_proxy_and_tees_safe_logs() {
             fs::read(f.0.join("state/tokenmaxx/ping.log")).unwrap(),
             output.stdout
         );
+        let state_bytes = fs::read(&state_path).unwrap();
+        if statuses == [500, 500] {
+            assert_eq!(state_bytes, previous);
+        } else {
+            let state: serde_json::Value = serde_json::from_slice(&state_bytes).unwrap();
+            let last = state["last_ping_epoch"].as_u64().unwrap();
+            assert!((before..=after).contains(&last));
+            assert_eq!(state["next_due_epoch"], last + 18000);
+            let idle = f.run(&["auto", "--json"]);
+            assert_eq!(idle.status.code(), Some(0));
+            assert!(idle.stderr.is_empty());
+            let report: serde_json::Value = serde_json::from_slice(&idle.stdout).unwrap();
+            assert_eq!(report["decision"], "not_due");
+            assert_eq!(report["state"], state);
+            assert_eq!(fs::read(&state_path).unwrap(), state_bytes);
+            assert_eq!(
+                fs::read(f.0.join("state/tokenmaxx/ping.log")).unwrap(),
+                output.stdout
+            );
+        }
         for request in requests {
             assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
             let (headers, body) = request.split_once("\r\n\r\n").unwrap();

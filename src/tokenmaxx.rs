@@ -145,22 +145,44 @@ fn read_body(response: ureq::Response) -> String {
     response.into_string().unwrap_or_default()
 }
 
+/// Rendered quota and schedule metadata from the same fetch.
+struct QuotaSnapshot {
+    text: String,
+    reset_epoch: Option<u64>,
+}
+
 /// Injectable quota snapshot seam around the frozen `quota` module API.
 trait Snapshot {
-    fn render(&self, dir: &Path, paths: &Paths, config: &Config) -> Result<String, String>;
+    fn render(&self, dir: &Path, paths: &Paths, config: &Config) -> Result<QuotaSnapshot, String>;
 }
 
 struct LiveSnapshot;
 
 impl Snapshot for LiveSnapshot {
-    fn render(&self, dir: &Path, paths: &Paths, config: &Config) -> Result<String, String> {
+    fn render(&self, dir: &Path, paths: &Paths, config: &Config) -> Result<QuotaSnapshot, String> {
         let accounts = crate::quota::fetch(dir, paths, config, &[], false)?;
-        Ok(crate::quota::render_human(
-            &accounts,
-            dir,
-            crate::time::now(),
-        ))
+        Ok(QuotaSnapshot {
+            reset_epoch: codex_reset(&accounts),
+            text: crate::quota::render_human(&accounts, dir, crate::time::now()),
+        })
     }
+}
+
+fn codex_reset(accounts: &[crate::quota::Account]) -> Option<u64> {
+    // The earliest window keeps every Codex account on a conservative schedule.
+    accounts
+        .iter()
+        .filter(|account| account.provider == "codex")
+        .flat_map(|account| &account.windows)
+        .filter(|window| window.label == "5h")
+        .filter_map(|window| {
+            let reset = window.reset_at.as_ref()?;
+            reset
+                .as_u64()
+                .or_else(|| u64::try_from(crate::time::parse_iso(reset.as_str()?)?).ok())
+        })
+        .filter(|reset| *reset > 0)
+        .min()
 }
 
 /// Destination for timestamped lines; production tees a file and stdout.
@@ -326,8 +348,19 @@ fn run_with(
         sink.write_line(&line)?;
     }
 
-    if !args.no_quota {
-        record_snapshot(auth_dir.as_deref(), paths, config, seams.snapshot, sink)?;
+    let last_ping_epoch = crate::time::now().max(0) as u64;
+    let reset_epoch = if args.no_quota {
+        None
+    } else {
+        record_snapshot(auth_dir.as_deref(), paths, config, seams.snapshot, sink)?
+    };
+    if succeeded > 0 {
+        crate::auto::record_success(
+            &paths.auto_state_file(),
+            last_ping_epoch,
+            config.tokenmaxx.interval_hours,
+            reset_epoch,
+        )?;
     }
 
     Ok(i32::from(succeeded == 0))
@@ -352,20 +385,21 @@ fn record_snapshot(
     config: &Config,
     snapshot: &dyn Snapshot,
     sink: &mut dyn LogSink,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     match dir.map(|dir| snapshot_with_retry(dir, paths, config, snapshot)) {
-        Some(Ok(text)) => {
-            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        Some(Ok(snapshot)) => {
+            for line in snapshot.text.lines().filter(|line| !line.trim().is_empty()) {
                 sink.write_line(&format!("{} quota| {}", timestamp(), line.trim()))?;
             }
+            Ok(snapshot.reset_epoch)
         }
         // The raw snapshot error can contain paths or provider details; keep a
         // fixed line and preserve the ping outcome.
         Some(Err(_)) | None => {
             sink.write_line(&format!("{} quota snapshot unavailable", timestamp()))?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 /// Renders the quota snapshot, retrying once: a transient DNS/connect failure
@@ -375,7 +409,7 @@ fn snapshot_with_retry(
     paths: &Paths,
     config: &Config,
     snapshot: &dyn Snapshot,
-) -> Result<String, String> {
+) -> Result<QuotaSnapshot, String> {
     snapshot
         .render(dir, paths, config)
         .or_else(|_| snapshot.render(dir, paths, config))
@@ -497,6 +531,7 @@ mod tests {
     struct FixedSnapshot {
         results: RefCell<VecDeque<Result<String, String>>>,
         calls: Cell<usize>,
+        reset_epoch: Option<u64>,
     }
 
     impl FixedSnapshot {
@@ -508,17 +543,22 @@ mod tests {
             Self {
                 results: RefCell::new(results.into_iter().collect()),
                 calls: Cell::new(0),
+                reset_epoch: None,
             }
         }
     }
 
     impl Snapshot for FixedSnapshot {
-        fn render(&self, _: &Path, _: &Paths, _: &Config) -> Result<String, String> {
+        fn render(&self, _: &Path, _: &Paths, _: &Config) -> Result<QuotaSnapshot, String> {
             self.calls.set(self.calls.get() + 1);
             self.results
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Ok(String::new()))
+                .map(|text| QuotaSnapshot {
+                    text,
+                    reset_epoch: self.reset_epoch,
+                })
         }
     }
 
@@ -602,6 +642,133 @@ mod tests {
             retry,
         };
         run_with(args, paths, config, &proxy, &seams, sink)
+    }
+
+    #[test]
+    fn codex_reset_selects_earliest_5h_reset_not_other_windows_or_providers() {
+        use crate::quota::{Account, Window};
+        let window = |label: &str, reset_at| Window {
+            label: label.into(),
+            reset_at: Some(reset_at),
+            ..Window::default()
+        };
+        let mut accounts = vec![
+            Account {
+                provider: "claude".into(),
+                windows: vec![window("5h", serde_json::json!(1))],
+                ..Account::default()
+            },
+            Account {
+                provider: "codex".into(),
+                windows: vec![
+                    window("7d", serde_json::json!(2)),
+                    window("5h", serde_json::json!(500)),
+                ],
+                ..Account::default()
+            },
+            Account {
+                provider: "codex".into(),
+                windows: vec![window("5h", serde_json::json!("1970-01-01T00:05:00Z"))],
+                ..Account::default()
+            },
+        ];
+        assert_eq!(codex_reset(&accounts), Some(300));
+        accounts[2].windows[0].reset_at = Some(serde_json::json!(-1));
+        assert_eq!(codex_reset(&accounts), Some(500));
+        accounts[1].windows[1].reset_at = None;
+        assert_eq!(codex_reset(&accounts), None);
+    }
+
+    #[test]
+    fn manual_ping_replaces_schedule_with_snapshot_reset_even_on_partial_success() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        auth_dir(&paths, &["codex-a.json"]);
+        let config = fixture_config();
+        let mut args = args();
+        args.pings = Some(2);
+        let path = paths.auto_state_file();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"last_ping_epoch":10,"next_due_epoch":20}"#).unwrap();
+        let mut snapshot = FixedSnapshot::ok("quota snapshot");
+        snapshot.reset_epoch = Some(2_000_000_000);
+        let transport = FakeTransport::with([ok_reply(500, ""), ok_reply(200, "")]);
+        let mut sink = Capture::default();
+        assert_eq!(
+            execute(&args, &paths, &config, &transport, &mut sink, &snapshot).unwrap(),
+            0
+        );
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(state["next_due_epoch"], 2_000_000_000u64);
+        assert!(state["last_ping_epoch"].as_u64().unwrap() > 10);
+        assert_eq!(snapshot.calls.get(), 1);
+        assert_eq!(transport.requests(), 2);
+        assert_eq!(sink.lines.len(), 3);
+    }
+
+    #[test]
+    fn manual_ping_writes_private_state_with_interval_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        let mut config = fixture_config();
+        config.tokenmaxx.interval_hours = 3;
+        let mut args = args();
+        args.no_quota = true;
+        let snapshot = FixedSnapshot::ok("");
+        let transport = FakeTransport::default();
+        let mut sink = Capture::default();
+        let before = crate::time::now() as u64;
+        assert_eq!(
+            execute(&args, &paths, &config, &transport, &mut sink, &snapshot).unwrap(),
+            0
+        );
+        let after = crate::time::now() as u64;
+        let path = paths.auto_state_file();
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let last = state["last_ping_epoch"].as_u64().unwrap();
+        assert!((before..=after).contains(&last));
+        assert_eq!(state["next_due_epoch"], last + 10800);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert_eq!(snapshot.calls.get(), 0);
+        assert_eq!(transport.requests(), 1);
+        assert_eq!(sink.lines.len(), 1);
+    }
+
+    #[test]
+    fn failed_manual_ping_preserves_schedule_or_leaves_it_missing() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        let config = fixture_config();
+        let mut args = args();
+        args.no_quota = true;
+        let path = paths.auto_state_file();
+        let previous = br#"{"last_ping_epoch":10,"next_due_epoch":20}"#;
+        for existing in [false, true] {
+            if existing {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, previous).unwrap();
+            }
+            let transport = FakeTransport::with([ok_reply(500, "")]);
+            let snapshot = FixedSnapshot::ok("");
+            let mut sink = Capture::default();
+            assert_eq!(
+                execute(&args, &paths, &config, &transport, &mut sink, &snapshot).unwrap(),
+                1
+            );
+            if existing {
+                assert_eq!(fs::read(&path).unwrap(), previous);
+            } else {
+                assert!(!path.exists());
+            }
+            assert_eq!(transport.requests(), 1);
+            assert_eq!(snapshot.calls.get(), 0);
+            assert_eq!(sink.lines.len(), 1);
+        }
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
             "not_due" => {
                 if let Some(state) = report.state {
                     println!(
-                        "auto: next due {} (in {}m)",
+                        "auto: next due {} (in {}m; not due)",
                         rfc3339(state.next_due_epoch),
                         state.next_due_epoch.saturating_sub(now).div_ceil(60)
                     );
@@ -107,23 +107,45 @@ fn run_with(
         report.decision = "not_due";
         return Ok((report, 0));
     }
-    let state = State {
-        last_ping_epoch: now,
-        next_due_epoch: now
-            .checked_add(u64::from(config.tokenmaxx.interval_hours) * 3600)
-            .ok_or("Auto schedule overflow")?,
-    };
     report.decision = "due";
-    report.state = Some(state);
     let code = if dry_run {
+        report.state = Some(scheduled_state(now, config.tokenmaxx.interval_hours, None)?);
         0
     } else {
         let code = ping()?;
-        let bytes = serde_json::to_vec(&state).map_err(|_| "Cannot serialize auto state")?;
-        atomic_write(path, &bytes).map_err(|_| "Cannot save auto state atomically")?;
+        // The shared keep-alive pass owns persistence, including manual pings.
+        report.state = read_state(path)?;
         code
     };
     Ok((report, code))
+}
+
+fn scheduled_state(
+    now: u64,
+    interval_hours: u32,
+    reset_epoch: Option<u64>,
+) -> Result<State, String> {
+    Ok(State {
+        last_ping_epoch: now,
+        next_due_epoch: match reset_epoch {
+            Some(reset) => reset,
+            None => now
+                .checked_add(u64::from(interval_hours) * 3600)
+                .ok_or("Auto schedule overflow")?,
+        },
+    })
+}
+
+/// Persist the shared schedule only after the caller has observed a successful ping.
+pub(crate) fn record_success(
+    path: &Path,
+    now: u64,
+    interval_hours: u32,
+    reset_epoch: Option<u64>,
+) -> Result<(), String> {
+    let state = scheduled_state(now, interval_hours, reset_epoch)?;
+    let bytes = serde_json::to_vec(&state).map_err(|_| "Cannot serialize auto state")?;
+    atomic_write(path, &bytes).map_err(|_| "Cannot save auto state atomically".into())
 }
 
 fn rfc3339(epoch: u64) -> String {
@@ -150,6 +172,7 @@ mod tests {
         let calls = Cell::new(0);
         let (report, code) = run_with(&Config::default(), &path, 100, false, || {
             calls.set(calls.get() + 1);
+            record_success(&path, 100, 5, None)?;
             Ok(0)
         })
         .unwrap();
@@ -172,6 +195,27 @@ mod tests {
     }
 
     #[test]
+    fn due_auto_reports_the_shared_pass_reset_without_overwriting_it() {
+        let s = Sandbox::default();
+        let path = s.0.join("auto.json");
+        let (report, code) = run_with(&Config::default(), &path, 100, false, || {
+            record_success(&path, 101, 5, Some(500))?;
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(report.decision, "due");
+        assert_eq!(
+            report.state,
+            Some(State {
+                last_ping_epoch: 101,
+                next_due_epoch: 500
+            })
+        );
+        assert_eq!(read_state(&path).unwrap(), report.state);
+    }
+
+    #[test]
     fn corrupt_state_is_due_and_replaced() {
         let s = Sandbox::default();
         let path = s.0.join("auto.json");
@@ -181,7 +225,11 @@ mod tests {
             br#"{"last_ping_epoch":-1,"next_due_epoch":1000}"#,
         ] {
             fs::write(&path, bytes).unwrap();
-            let (report, _) = run_with(&Config::default(), &path, 100, false, || Ok(0)).unwrap();
+            let (report, _) = run_with(&Config::default(), &path, 100, false, || {
+                record_success(&path, 100, 5, None)?;
+                Ok(0)
+            })
+            .unwrap();
             assert_eq!(report.decision, "due");
             assert_eq!(read_state(&path).unwrap().unwrap().next_due_epoch, 18100);
         }
@@ -192,7 +240,11 @@ mod tests {
         let s = Sandbox::default();
         let path = s.0.join("auto.json");
         fs::write(&path, br#"{"last_ping_epoch":0,"next_due_epoch":100}"#).unwrap();
-        let (report, _) = run_with(&Config::default(), &path, 100, false, || Ok(0)).unwrap();
+        let (report, _) = run_with(&Config::default(), &path, 100, false, || {
+            record_success(&path, 100, 5, None)?;
+            Ok(0)
+        })
+        .unwrap();
         assert_eq!(report.decision, "due");
         assert_eq!(read_state(&path).unwrap().unwrap().last_ping_epoch, 100);
     }
@@ -276,12 +328,15 @@ mod tests {
     }
 
     #[test]
-    fn completed_failed_pass_records_state_and_preserves_exit_one() {
+    fn completed_failed_pass_preserves_state_and_exit_one() {
         let s = Sandbox::default();
         let path = s.0.join("auto.json");
-        let (_, code) = run_with(&Config::default(), &path, 100, false, || Ok(1)).unwrap();
+        let bytes = br#"{"last_ping_epoch":0,"next_due_epoch":100}"#;
+        fs::write(&path, bytes).unwrap();
+        let (report, code) = run_with(&Config::default(), &path, 100, false, || Ok(1)).unwrap();
         assert_eq!(code, 1);
-        assert_eq!(read_state(&path).unwrap().unwrap().next_due_epoch, 18100);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(report.state.unwrap().next_due_epoch, 100);
     }
 
     #[test]
