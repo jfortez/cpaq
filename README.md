@@ -17,8 +17,8 @@ cpaq                # TUI: Quotas | Tokenmaxx
 cpaq quota          # headless quota report
 cpaq quota --json   # machine-readable output
 cpaq ping           # unconditional keep-alive pass
-cpaq auto           # local due check; ping only when due (systemd timer)
-cpaq auto --dry-run # decision and would-be state, without HTTP or writes
+cpaq auto           # local due check and bounded early-reset probe (systemd timer)
+cpaq auto --dry-run # decision and would-be state; quota reads only, no ping/writes
 cpaq units apply    # save config and regenerate/enable the user units
 ```
 
@@ -39,6 +39,7 @@ enabled = true
 auto = true       # default, including older configs
 anchor = "05:00"
 interval_hours = 5
+probe_minutes = 15 # early-reset check interval; 0 disables
 model = "gpt-6-luna"
 ```
 
@@ -54,16 +55,25 @@ Saving the Tokenmaxx tab writes `tokenmaxx.service` and `tokenmaxx.timer` under
 `$XDG_CONFIG_HOME/systemd/user`, reloads systemd and enables the timer. The
 service waits for `network-online.target`, runs `cpaq auto`, and re-arms the
 timer after every run, so a boot catch-up or a failed run does not break the
-chain. With `auto = true`, the timer checks every five minutes; local state alone
-controls when to ping. With `auto = false`, the timer retains the configured
+chain. With `auto = true`, the timer checks every five minutes; local state
+controls when to ping or probe. With `auto = false`, the timer retains the configured
 anchor and hourly interval. A boot check runs after 90 seconds. `auto` reads only
 `$XDG_STATE_HOME/tokenmaxx/auto.json` (`~/.local/state/tokenmaxx/auto.json`)
-until due; idle checks do not read auth or contact Docker/providers. State is
-shared by `ping` and `auto`, written atomically with mode 0600 after at least one
-successful ping; failed passes leave it unchanged. The next due time is the
+until a ping or probe is due; other idle checks do not read auth or contact
+Docker/providers. State is shared by `ping` and `auto`, written atomically with
+mode 0600 after a successful ping or a probe attempt. Failed pings preserve the
+schedule; probe attempts advance only `last_probe_epoch` unless a ping succeeds. The next due time is the
 earliest Codex 5h reset from the existing quota snapshot, falling back to the
 last ping plus `interval_hours` when unavailable (including `--no-quota`).
 `--json` returns the decision and state; ping details still go to the normal log.
+Early resets: every `probe_minutes` (default 15; `0` disables), auto reads the
+existing Codex quota snapshot. A 5h reset more than 60 seconds later than the
+stored window, with usage at most 1% and no blocked/limited/error Codex account,
+triggers one immediate ping. Unknown/high usage or unavailable quota only advances
+the probe timestamp, not the schedule. Legacy state compares against `next_due_epoch`.
+`--dry-run` reports the probe, comparison and would-be state without pinging or
+writing. Auto sends at most one ping request, without transport retries.
+
 `cpaq ping` retries transport failures (DNS, connect, timeout) up to three attempts
 with short backoff, keeps a whole run inside a two-minute budget, and
 retries the quota snapshot once; HTTP 4xx/5xx responses are not retried.

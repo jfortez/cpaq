@@ -258,7 +258,15 @@ pub(crate) fn run_output(
         transport: &UreqTransport,
         backoff: &ThreadBackoff,
         snapshot: &LiveSnapshot,
-        retry: Retry::default(),
+        retry: if args.mode == crate::cli::Mode::Auto {
+            Retry {
+                attempts: 1,
+                delays: Vec::new(),
+                ..Retry::default()
+            }
+        } else {
+            Retry::default()
+        },
     };
     if stdout {
         run_with(
@@ -293,9 +301,12 @@ fn run_with(
     let auth_dir = paths.resolve_auth(None, config.auth_dir()).ok();
     let accounts = auth_dir.as_deref().map_or(0, count_accounts);
     let per_account = config.tokenmaxx.pings_per_account.max(1);
-    let total = args
-        .pings
-        .unwrap_or_else(|| accounts.saturating_mul(per_account).max(1));
+    let total = if args.mode == crate::cli::Mode::Auto {
+        1
+    } else {
+        args.pings
+            .unwrap_or_else(|| accounts.saturating_mul(per_account).max(1))
+    };
     let model = args
         .model
         .clone()

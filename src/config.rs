@@ -44,6 +44,7 @@ pub struct TokenmaxxConfig {
     pub auto: bool,
     pub anchor: String,
     pub interval_hours: u32,
+    pub probe_minutes: u32,
     pub model: String,
     pub pings_per_account: usize,
     pub log_path: Option<PathBuf>,
@@ -59,6 +60,7 @@ impl Default for TokenmaxxConfig {
             auto: default_auto(),
             anchor: "05:00".into(),
             interval_hours: 5,
+            probe_minutes: 15,
             model: "gpt-6-luna".into(),
             pings_per_account: 1,
             log_path: None,
@@ -199,6 +201,19 @@ mod tests {
             toml::from_str(&toml::to_string(&Config::load(&file).unwrap()).unwrap()).unwrap();
         assert_eq!(value["tokenmaxx"]["auto"].as_bool(), Some(false));
     }
+    #[test]
+    fn probe_interval_defaults_for_legacy_config_and_zero_round_trips() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("config.toml");
+        assert_eq!(Config::load(&path).unwrap().tokenmaxx.probe_minutes, 15);
+        let mut config: Config = toml::from_str("[tokenmaxx]\ninterval_hours=3").unwrap();
+        assert_eq!(config.tokenmaxx.probe_minutes, 15);
+        config.tokenmaxx.probe_minutes = 0;
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().tokenmaxx.probe_minutes, 0);
+        assert_eq!(Config::load(&path).unwrap().tokenmaxx.interval_hours, 3);
+    }
+
     #[test]
     fn config_round_trip_and_private_atomic_save() {
         use std::os::unix::fs::PermissionsExt;

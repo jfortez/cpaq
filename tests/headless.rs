@@ -274,7 +274,7 @@ fn auto_idle_and_dry_run_short_circuit_without_credentials_or_auth() {
     fs::create_dir_all(state.parent().unwrap()).unwrap();
     let now = cpaq::time::now() as u64;
     let previous = format!(
-        r#"{{"last_ping_epoch":{now},"next_due_epoch":{}}}"#,
+        r#"{{"last_ping_epoch":{now},"last_probe_epoch":{now},"next_due_epoch":{}}}"#,
         now + 18000
     );
     fs::write(&state, &previous).unwrap();
@@ -318,6 +318,47 @@ fn auto_idle_and_dry_run_short_circuit_without_credentials_or_auth() {
     );
     assert!(!state.exists());
     assert!(!f.0.join("state/tokenmaxx/ping.log").exists());
+}
+
+#[test]
+fn public_auto_probe_error_advances_only_probe_timestamp_and_dry_run_never_writes() {
+    let f = Fixture::new();
+    let path = f.0.join("state/tokenmaxx/auto.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let now = cpaq::time::now() as u64;
+    let previous = format!(
+        r#"{{"last_ping_epoch":10,"next_due_epoch":{},"window_reset_epoch":{}}}"#,
+        now + 18000,
+        now + 18000
+    );
+    fs::write(&path, &previous).unwrap();
+    for dry_run in [true, false] {
+        let args = if dry_run {
+            vec!["auto", "--json", "--dry-run"]
+        } else {
+            vec!["auto", "--json"]
+        };
+        let out = f.run(&args);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["decision"], "not_due");
+        assert_eq!(report["probe_due"], true);
+        assert_eq!(report["early_reset_detected"], false);
+        assert_eq!(report["state"]["last_ping_epoch"], 10);
+        assert_eq!(report["state"]["next_due_epoch"], now + 18000);
+        assert!(report["state"]["last_probe_epoch"].as_u64().unwrap() >= now);
+        if dry_run {
+            assert_eq!(fs::read_to_string(&path).unwrap(), previous);
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+                report["state"]
+            );
+        }
+        assert!(!f.0.join("state/tokenmaxx/ping.log").exists());
+        assert!(!f.0.join("config/systemd").exists());
+    }
 }
 
 #[test]
@@ -495,5 +536,79 @@ fn public_auto_due_json_pings_once_logs_and_then_stays_idle() {
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
+    }
+}
+
+#[test]
+fn public_auto_caps_multi_account_pass_and_never_retries_failed_request() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+    for transport_error in [false, true] {
+        let f = Fixture::new();
+        for file in ["other-a.json", "other-b.json"] {
+            fs::write(f.0.join("auths").join(file), r#"{"type":"other"}"#).unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(split) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+                assert!(request.len() < 16384);
+            }
+            if !transport_error {
+                write!(
+                    stream,
+                    "HTTP/1.1 503 Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+            drop(stream);
+            listener
+        });
+        fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
+        fs::write(f.0.join("config/cpaq/config.toml"), format!(
+            "[auth]\ndir='{}'\n[proxy]\nbase_url='http://{address}'\napi_key='fixture'\ntimeout_secs=1\n[tokenmaxx]\npings_per_account=3\n", f.auth_path()
+        )).unwrap();
+        let out = f.run(&["auto", "--json"]);
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["decision"], "due");
+        assert_eq!(report["state"], serde_json::Value::Null);
+        assert!(!f.0.join("state/tokenmaxx/auto.json").exists());
+        let log = fs::read_to_string(f.0.join("state/tokenmaxx/ping.log")).unwrap();
+        assert_eq!(
+            log.lines().filter(|line| line.contains(" ping ")).count(),
+            1
+        );
+        assert!(log.contains("ping 1/1"));
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
 }

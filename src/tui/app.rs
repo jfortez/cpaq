@@ -463,6 +463,7 @@ impl App {
             auto: self.tokenmaxx.draft.auto,
             anchor: self.tokenmaxx.draft.anchor.trim().to_string(),
             interval_hours,
+            probe_minutes: self.base_config.tokenmaxx.probe_minutes,
             model: self.tokenmaxx.draft.model.trim().to_string(),
             pings_per_account: self.base_config.tokenmaxx.pings_per_account,
             log_path,
@@ -1249,6 +1250,7 @@ mod tests {
         let mut app = test_app();
         app.base_config.proxy.api_key = "fixture".into();
         app.base_config.tokenmaxx.pings_per_account = 3;
+        app.base_config.tokenmaxx.probe_minutes = 0;
         app.tokenmaxx.draft.anchor = "06:30".into();
         app.tokenmaxx.draft.interval_hours = "7".into();
         app.tokenmaxx.draft.model = "gpt-test".into();
@@ -1257,6 +1259,7 @@ mod tests {
         let config = app.build_config().unwrap();
         assert_eq!(config.proxy.api_key, "fixture");
         assert_eq!(config.tokenmaxx.pings_per_account, 3);
+        assert_eq!(config.tokenmaxx.probe_minutes, 0);
         assert_eq!(config.tokenmaxx.anchor, "06:30");
         assert_eq!(config.tokenmaxx.interval_hours, 7);
         assert_eq!(config.tokenmaxx.model, "gpt-test");
