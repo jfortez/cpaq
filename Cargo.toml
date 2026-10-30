@@ -2,8 +2,20 @@
 name = "cpaq"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "CLIProxyAPI quotas and tokenmaxx management"
+readme = "README.md"
 license = "MIT"
+repository = "https://github.com/jfortez/cpaq"
+homepage = "https://github.com/jfortez/cpaq"
+keywords = ["cli", "tui", "quota", "cli-proxy", "tokenmaxx"]
+categories = [
+    "command-line-interface",
+    "command-line-utilities",
+    "development-tools",
+    "network-programming",
+]
+exclude = ["odd/*", ".github/*", "tests/*"]
 
 [dependencies]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }

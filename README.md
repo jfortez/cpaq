@@ -6,6 +6,12 @@ Single Rust binary, no async runtime.
 ## Install
 
 ```sh
+cargo install cpaq
+```
+
+Or from a local checkout:
+
+```sh
 cargo build --release
 install -m755 target/release/cpaq ~/.local/bin/cpaq
 ```
@@ -92,3 +98,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
+
+## Releasing
+
+Releases are patch-only: the minor version stays pinned at 1, so versions are
+always `0.1.N`. From `main`, run the `release` workflow (Actions → release →
+Run workflow). It runs the checks, bumps the patch with `scripts/release.sh`,
+commits `chore(release): vX.Y.Z`, tags it, publishes to crates.io and creates
+the GitHub release with generated notes.
+
+`scripts/release.sh --dry-run` prints the next version and writes nothing.
+
+One-time maintainer setup: add a crates.io API token with publish scope as the
+`CARGO_REGISTRY_TOKEN` repository secret (Settings → Secrets and variables →
+Actions). No other secret is needed.
