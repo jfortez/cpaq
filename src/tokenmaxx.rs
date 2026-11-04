@@ -148,7 +148,7 @@ fn read_body(response: ureq::Response) -> String {
 /// Rendered quota and schedule metadata from the same fetch.
 struct QuotaSnapshot {
     text: String,
-    reset_epoch: Option<u64>,
+    schedule: Option<crate::auto::Schedule>,
 }
 
 /// Injectable quota snapshot seam around the frozen `quota` module API.
@@ -160,29 +160,13 @@ struct LiveSnapshot;
 
 impl Snapshot for LiveSnapshot {
     fn render(&self, dir: &Path, paths: &Paths, config: &Config) -> Result<QuotaSnapshot, String> {
+        let now = crate::time::now().max(0) as u64;
         let accounts = crate::quota::fetch(dir, paths, config, &[], false)?;
         Ok(QuotaSnapshot {
-            reset_epoch: codex_reset(&accounts),
+            schedule: crate::auto::schedule_from(&accounts, now),
             text: crate::quota::render_human(&accounts, dir, crate::time::now()),
         })
     }
-}
-
-fn codex_reset(accounts: &[crate::quota::Account]) -> Option<u64> {
-    // The earliest window keeps every Codex account on a conservative schedule.
-    accounts
-        .iter()
-        .filter(|account| account.provider == "codex")
-        .flat_map(|account| &account.windows)
-        .filter(|window| window.label == "5h")
-        .filter_map(|window| {
-            let reset = window.reset_at.as_ref()?;
-            reset
-                .as_u64()
-                .or_else(|| u64::try_from(crate::time::parse_iso(reset.as_str()?)?).ok())
-        })
-        .filter(|reset| *reset > 0)
-        .min()
 }
 
 /// Destination for timestamped lines; production tees a file and stdout.
@@ -360,7 +344,7 @@ fn run_with(
     }
 
     let last_ping_epoch = crate::time::now().max(0) as u64;
-    let reset_epoch = if args.no_quota {
+    let schedule = if args.no_quota {
         None
     } else {
         record_snapshot(auth_dir.as_deref(), paths, config, seams.snapshot, sink)?
@@ -370,7 +354,7 @@ fn run_with(
             &paths.auto_state_file(),
             last_ping_epoch,
             config.tokenmaxx.interval_hours,
-            reset_epoch,
+            schedule,
         )?;
     }
 
@@ -396,13 +380,13 @@ fn record_snapshot(
     config: &Config,
     snapshot: &dyn Snapshot,
     sink: &mut dyn LogSink,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<crate::auto::Schedule>, String> {
     match dir.map(|dir| snapshot_with_retry(dir, paths, config, snapshot)) {
         Some(Ok(snapshot)) => {
             for line in snapshot.text.lines().filter(|line| !line.trim().is_empty()) {
                 sink.write_line(&format!("{} quota| {}", timestamp(), line.trim()))?;
             }
-            Ok(snapshot.reset_epoch)
+            Ok(snapshot.schedule)
         }
         // The raw snapshot error can contain paths or provider details; keep a
         // fixed line and preserve the ping outcome.
@@ -542,7 +526,7 @@ mod tests {
     struct FixedSnapshot {
         results: RefCell<VecDeque<Result<String, String>>>,
         calls: Cell<usize>,
-        reset_epoch: Option<u64>,
+        schedule: Option<crate::auto::Schedule>,
     }
 
     impl FixedSnapshot {
@@ -554,7 +538,7 @@ mod tests {
             Self {
                 results: RefCell::new(results.into_iter().collect()),
                 calls: Cell::new(0),
-                reset_epoch: None,
+                schedule: None,
             }
         }
     }
@@ -568,7 +552,7 @@ mod tests {
                 .unwrap_or_else(|| Ok(String::new()))
                 .map(|text| QuotaSnapshot {
                     text,
-                    reset_epoch: self.reset_epoch,
+                    schedule: self.schedule,
                 })
         }
     }
@@ -656,41 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_reset_selects_earliest_5h_reset_not_other_windows_or_providers() {
-        use crate::quota::{Account, Window};
-        let window = |label: &str, reset_at| Window {
-            label: label.into(),
-            reset_at: Some(reset_at),
-            ..Window::default()
-        };
-        let mut accounts = vec![
-            Account {
-                provider: "claude".into(),
-                windows: vec![window("5h", serde_json::json!(1))],
-                ..Account::default()
-            },
-            Account {
-                provider: "codex".into(),
-                windows: vec![
-                    window("7d", serde_json::json!(2)),
-                    window("5h", serde_json::json!(500)),
-                ],
-                ..Account::default()
-            },
-            Account {
-                provider: "codex".into(),
-                windows: vec![window("5h", serde_json::json!("1970-01-01T00:05:00Z"))],
-                ..Account::default()
-            },
-        ];
-        assert_eq!(codex_reset(&accounts), Some(300));
-        accounts[2].windows[0].reset_at = Some(serde_json::json!(-1));
-        assert_eq!(codex_reset(&accounts), Some(500));
-        accounts[1].windows[1].reset_at = None;
-        assert_eq!(codex_reset(&accounts), None);
-    }
-
-    #[test]
     fn manual_ping_replaces_schedule_with_snapshot_reset_even_on_partial_success() {
         let sandbox = Sandbox::default();
         let paths = sandbox_paths(&sandbox);
@@ -702,7 +651,11 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, br#"{"last_ping_epoch":10,"next_due_epoch":20}"#).unwrap();
         let mut snapshot = FixedSnapshot::ok("quota snapshot");
-        snapshot.reset_epoch = Some(2_000_000_000);
+        snapshot.schedule = Some(crate::auto::Schedule {
+            next_due_epoch: 2_000_000_000,
+            window_reset_epoch: 2_000_000_000,
+            long_window_reset_epoch: 0,
+        });
         let transport = FakeTransport::with([ok_reply(500, ""), ok_reply(200, "")]);
         let mut sink = Capture::default();
         assert_eq!(

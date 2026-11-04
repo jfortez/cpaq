@@ -67,16 +67,24 @@ anchor and hourly interval. A boot check runs after 90 seconds. `auto` reads onl
 `$XDG_STATE_HOME/tokenmaxx/auto.json` (`~/.local/state/tokenmaxx/auto.json`)
 until a ping or probe is due; other idle checks do not read auth or contact
 Docker/providers. State is shared by `ping` and `auto`, written atomically with
-mode 0600 after a successful ping or a probe attempt. Failed pings preserve the
-schedule; probe attempts advance only `last_probe_epoch` unless a ping succeeds. The next due time is the
-earliest Codex 5h reset from the existing quota snapshot, falling back to the
-last ping plus `interval_hours` when unavailable (including `--no-quota`).
-`--json` returns the decision and state; ping details still go to the normal log.
+mode 0600 after a successful ping or a probe attempt. Probe attempts advance
+`last_probe_epoch`; a failed ping preserves the schedule unless every Codex
+account is spent, in which case auto waits for the earliest reopening instead of
+retrying every five minutes.
+
+The next due time is the earliest moment a Codex account can serve again: its 5h
+reset when nothing is capped, or the latest reset among its spent windows, so a
+weekly-capped account waits for the weekly reset even while its 5h window rolls.
+It falls back to the last ping plus `interval_hours` when the snapshot is
+unavailable (including `--no-quota`).
+
 Early resets: every `probe_minutes` (default 15; `0` disables), auto reads the
-existing Codex quota snapshot. A 5h reset more than 60 seconds later than the
-stored window, with usage at most 1% and no blocked/limited/error Codex account,
-triggers one immediate ping. Unknown/high usage or unavailable quota only advances
-the probe timestamp, not the schedule. Legacy state compares against `next_due_epoch`.
+existing Codex quota snapshot. The earliest 5h or weekly reset that moved more
+than 60 seconds later than its stored anchor, with usage at most 1% and only
+unblocked accounts considered, triggers one immediate ping; an earlier reopening
+shortens `next_due` without pinging. Unknown/high usage or unavailable quota only
+advances the probe timestamp, not the schedule. Legacy state compares the 5h
+anchor against `next_due_epoch`.
 `--dry-run` reports the probe, comparison and would-be state without pinging or
 writing. Auto sends at most one ping request, without transport retries.
 

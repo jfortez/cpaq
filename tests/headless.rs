@@ -64,7 +64,10 @@ fn public_help_and_version_are_successful_without_config() {
     }
     let version = f.run(&["--version"]);
     assert!(version.status.success());
-    assert_eq!(version.stdout, b"cpaq 0.1.0\n");
+    assert_eq!(
+        version.stdout,
+        format!("cpaq {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+    );
     assert!(version.stderr.is_empty());
 }
 #[test]
