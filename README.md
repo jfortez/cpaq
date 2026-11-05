@@ -25,6 +25,7 @@ cpaq quota --json   # machine-readable output
 cpaq ping           # unconditional keep-alive pass
 cpaq auto           # local due check and bounded early-reset probe (systemd timer)
 cpaq auto --dry-run # decision and would-be state; quota reads only, no ping/writes
+cpaq log            # journal tail: the last 20 ping records
 cpaq units apply    # save config and regenerate/enable the user units
 ```
 
@@ -113,6 +114,13 @@ per-account snapshot; unexpected provider movements (`window_reopened_early`,
 written as separate `reset_change` records. A journal write failure prints one
 warning and never changes the exit code or blocks a ping. The journal holds no
 credentials, and `cpaq auto --json` keeps its existing shape.
+
+`cpaq log` reads that journal: by default the last 20 `ping` records, oldest to
+newest, with `--all` widening the selection to ticks and reset changes and
+`--limit N` (`0` = all) choosing the tail. `--json` passes the raw JSONL lines
+through, and `--follow`/`-f` prints that tail once and then polls every 500 ms,
+reopening from zero after a truncation or a rotation, so a running tail survives
+`auto.log` becoming `auto.log.1`.
 
 ## Providers
 

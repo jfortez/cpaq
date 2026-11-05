@@ -25,6 +25,9 @@ fn execute(args: Args) -> Result<u8, String> {
     if args.mode == Mode::Auto {
         return cpaq::auto::run(&args, &paths, &config).map(|code| code as u8);
     }
+    if args.mode == Mode::Log {
+        return cpaq::log::run(&args, &paths).map(|code| code as u8);
+    }
     if args.mode == Mode::UnitsApply {
         let executable = std::env::current_exe()
             .map_err(|_| "Cannot determine cpaq executable path".to_string())?;

@@ -235,14 +235,16 @@ pub(crate) fn run_output(
     config: &Config,
     stdout: bool,
 ) -> Result<i32, String> {
-    // One ping record per pass, including a pass that could not start.
+    // One ping record per pass, including a pass that could not start. The
+    // record is stamped when the attempt begins, not when the pass returns.
+    let started = crate::time::now().max(0) as u64;
     match run_pass(args, paths, config, stdout) {
         Ok(code) => {
-            journal_ping(args, paths, config, code, None);
+            journal_ping(args, paths, config, code, None, started);
             Ok(code)
         }
         Err(error) => {
-            journal_ping(args, paths, config, 1, Some(&error));
+            journal_ping(args, paths, config, 1, Some(&error), started);
             Err(error)
         }
     }
@@ -283,14 +285,21 @@ fn run_pass(args: &Args, paths: &Paths, config: &Config, stdout: bool) -> Result
 }
 
 /// Appends this attempt's `ping` record, reading the schedule it left behind.
-fn journal_ping(args: &Args, paths: &Paths, config: &Config, code: i32, error: Option<&str>) {
+fn journal_ping(
+    args: &Args,
+    paths: &Paths,
+    config: &Config,
+    code: i32,
+    error: Option<&str>,
+    started: u64,
+) {
     let now = crate::time::now().max(0) as u64;
     let state = crate::auto::state_summary(&paths.auto_state_file());
     let model = args
         .model
         .clone()
         .unwrap_or_else(|| config.tokenmaxx.model.clone());
-    let mut record = crate::journal::base("ping", now);
+    let mut record = crate::journal::base("ping", started);
     let origin = if args.mode == crate::cli::Mode::Auto {
         "auto"
     } else {
@@ -309,6 +318,7 @@ fn journal_ping(args: &Args, paths: &Paths, config: &Config, code: i32, error: O
     );
     record.insert("exit".into(), code.into());
     record.insert("model".into(), model.into());
+    record.insert("finished_epoch".into(), now.into());
     if let Some(error) = error {
         record.insert("error".into(), crate::journal::sanitize_error(error).into());
     }
@@ -1211,6 +1221,37 @@ mod tests {
                 .iter()
                 .all(|line| !line.contains("quota snapshot unavailable"))
         );
+    }
+
+    #[test]
+    fn ping_record_starts_at_the_attempt_time() {
+        let sandbox = Sandbox::default();
+        let paths = sandbox_paths(&sandbox);
+        let config = fixture_config();
+        // A long pass: the record keeps the attempt start and adds the finish.
+        let started = 1000;
+        journal_ping(&args(), &paths, &config, 0, None, started);
+        let journal = fs::read_to_string(paths.auto_log_file()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+        assert_eq!(record["event"], "ping");
+        assert_eq!(record["ts_epoch"], started);
+        assert_eq!(
+            record["ts"].as_str().unwrap(),
+            crate::time::rfc3339(started)
+        );
+        let finished = record["finished_epoch"].as_u64().unwrap();
+        assert!(finished >= started, "{finished} < {started}");
+        assert_ne!(finished, started, "the fixture must finish after it starts");
+        // A failed pass is stamped the same way, with its error kept.
+        journal_ping(&args(), &paths, &config, 1, Some("No API key"), started + 5);
+        let journal = fs::read_to_string(paths.auto_log_file()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(record["ts_epoch"], started + 5);
+        assert_eq!(record["result"], "error");
+        assert_eq!(record["error"], "No API key");
+        assert!(record["finished_epoch"].as_u64().unwrap() >= started + 5);
     }
 
     #[test]

@@ -891,3 +891,138 @@ fn public_ping_error_still_journals_one_record() {
             .is_some_and(|model| !model.is_empty())
     );
 }
+
+const LOG_TICK: &str = r#"{"decision":"not_due","due_in_s":17964,"event":"tick","exit":0,"ts":"2026-11-05T18:15:46-05:00","ts_epoch":1793920546}"#;
+const LOG_PING_OK: &str = r#"{"event":"ping","exit":0,"model":"test-model","next_due_epoch":1793936426,"origin":"ping","result":"ok","ts":"2026-11-05T18:16:00-05:00","ts_epoch":1793920560}"#;
+const LOG_RESET: &str = r#"{"account":"acct-1","event":"reset_change","from":2,"kind":"banked_reset_used","to":1,"ts":"2026-11-05T18:17:00-05:00","ts_epoch":1793920620}"#;
+const LOG_PING_ERROR: &str = r#"{"error":"No API key","event":"ping","exit":1,"model":"test-model","next_due_epoch":0,"origin":"auto","result":"error","ts":"2026-11-05T18:18:00-05:00","ts_epoch":1793920680}"#;
+
+fn journal_fixture(f: &Fixture, lines: &[&str]) {
+    let path = f.0.join("state/tokenmaxx/auto.log");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+#[test]
+fn public_log_shows_pings_by_default_and_widens_with_all() {
+    let f = Fixture::new();
+    journal_fixture(&f, &[LOG_TICK, LOG_PING_OK, LOG_RESET, LOG_PING_ERROR]);
+
+    let out = f.run(&["log"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("2026-11-05T18:16:00-05:00  ping  ping  ok  model=test-model  next="),
+        "{}",
+        lines[0]
+    );
+    assert!(!lines[0].contains("error="));
+    assert!(
+        lines[1]
+            .starts_with("2026-11-05T18:18:00-05:00  ping  auto  error  model=test-model  next=-"),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[1].ends_with(r#"  exit=1  error="No API key""#));
+
+    // --json passes the journal lines through untouched.
+    let out = f.run(&["log", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{LOG_PING_OK}\n{LOG_PING_ERROR}\n")
+    );
+
+    // --all widens the selector and keeps the journal order.
+    let out = f.run(&["log", "--all"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(
+        lines[0],
+        "2026-11-05T18:15:46-05:00  tick  not_due  due_in=4h 59m 24s  wait=-  exit=0"
+    );
+    assert_eq!(
+        lines[2],
+        "2026-11-05T18:17:00-05:00  reset_change  banked_reset_used  acct-1  2 -> 1"
+    );
+
+    // --limit keeps the newest N after filtering; 0 means everything.
+    let out = f.run(&["log", "--all", "--limit", "2"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.lines().next().unwrap().contains("  reset_change  "));
+    let out = f.run(&["log", "--limit", "0"]);
+    assert_eq!(out.status.code(), Some(0));
+    let unlimited = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(unlimited.lines().count(), 2, "{unlimited}");
+    let out = f.run(&["log", "--all", "--limit", "0", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{LOG_TICK}\n{LOG_PING_OK}\n{LOG_RESET}\n{LOG_PING_ERROR}\n")
+    );
+}
+
+#[test]
+fn public_log_without_pings_says_so_and_keeps_stdout_clean() {
+    let f = Fixture::new();
+    journal_fixture(&f, &[LOG_TICK, LOG_TICK]);
+    let path = f.0.join("state/tokenmaxx/auto.log");
+    let notice = format!(
+        "log: no ping records yet in {} (2 tick(s) in the journal; use --all)\n",
+        path.display()
+    );
+    for args in [vec!["log"], vec!["log", "--json"]] {
+        let out = f.run(&args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), notice, "{args:?}");
+    }
+    // --all still shows the ticks and stays quiet.
+    let out = f.run(&["log", "--all"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.lines().all(|line| line.contains("  tick  ")));
+}
+
+#[test]
+fn public_log_missing_journal_is_a_friendly_exit_zero() {
+    let f = Fixture::new();
+    let out = f.run(&["log"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let path = f.0.join("state/tokenmaxx/auto.log");
+    assert_eq!(
+        stderr,
+        format!("log: no journal yet at {}\n", path.display())
+    );
+    // A follow request on a missing journal is not an error either.
+    let out = f.run(&["log", "--all", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn public_log_rejects_invalid_options() {
+    let f = Fixture::new();
+    for args in [
+        vec!["log", "--limit", "many"],
+        vec!["log", "--limit"],
+        vec!["log", "--dry-run"],
+        vec!["auto", "--follow"],
+    ] {
+        let out = f.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(!out.stderr.is_empty(), "{args:?}");
+    }
+}

@@ -210,7 +210,7 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
                     println!(
                         "auto: next due {} (in {}; not due)",
                         crate::time::rfc3339(state.next_due_epoch),
-                        duration_text(state.next_due_epoch.saturating_sub(now))
+                        crate::time::duration(state.next_due_epoch.saturating_sub(now))
                     );
                 }
             }
@@ -219,7 +219,7 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
                     println!(
                         "auto: deferred until {} (in {}; every Codex window is spent)",
                         crate::time::rfc3339(state.next_due_epoch),
-                        duration_text(state.next_due_epoch.saturating_sub(now))
+                        crate::time::duration(state.next_due_epoch.saturating_sub(now))
                     );
                 }
             }
@@ -815,18 +815,6 @@ pub(crate) fn record_success(
     let credits = read_state(path)?.map_or_else(BTreeMap::new, |state| state.credits);
     let state = scheduled_state(now, interval_hours, schedule)?.keep_credits(&credits);
     write_state(path, &state)
-}
-
-/// Seconds as `4h 59m 24s`, so an idle gap is readable at a glance.
-fn duration_text(seconds: u64) -> String {
-    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
-    if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
 }
 
 /// The single `tick` record every non-dry-run run appends.
@@ -2052,10 +2040,10 @@ mod tests {
 
     #[test]
     fn duration_text_shows_seconds() {
-        assert_eq!(duration_text(17964), "4h 59m 24s");
-        assert_eq!(duration_text(64), "1m 4s");
-        assert_eq!(duration_text(4), "4s");
-        assert_eq!(duration_text(0), "0s");
+        assert_eq!(crate::time::duration(17964), "4h 59m 24s");
+        assert_eq!(crate::time::duration(64), "1m 4s");
+        assert_eq!(crate::time::duration(4), "4s");
+        assert_eq!(crate::time::duration(0), "0s");
     }
 
     #[test]

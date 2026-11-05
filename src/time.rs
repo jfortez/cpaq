@@ -4,6 +4,17 @@ pub fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
+/// Compact duration: `4h 59m 24s`, `1m 4s`, `4s`.
+pub fn duration(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
 /// Local RFC3339 timestamp with a numeric offset.
 pub fn rfc3339(epoch: u64) -> String {
     let Ok(epoch) = i64::try_from(epoch) else {
