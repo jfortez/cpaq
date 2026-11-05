@@ -90,6 +90,7 @@ mod tests {
                 reset_after: Some(3600.0),
             }],
             error: error.map(str::to_string),
+            credits: None,
             raw: None,
         }
     }

@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::{Transport, USER_AGENT, metadata_text, redact, truthy};
 use crate::auth::Auth;
-use crate::quota::{Account, Window};
+use crate::quota::{Account, Credits, Window};
 
 pub(crate) const URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
@@ -44,6 +44,7 @@ pub(crate) fn fill(
         .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
         .map(window_from)
         .collect();
+    account.credits = data.get("rate_limit_reset_credits").and_then(credits_from);
 
     if raw {
         account.raw = Some(redact(&data, &auth.access_token));
@@ -56,6 +57,20 @@ fn bearer(auth: &Auth) -> Result<String, String> {
         return Err("no access_token in the auth file".into());
     }
     Ok(format!("Bearer {}", auth.access_token))
+}
+
+/// Banked reset credits: `available_count` plus how many can apply.
+fn credits_from(value: &Value) -> Option<Credits> {
+    let count = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok())
+    };
+    Some(Credits {
+        available: count("available_count")?,
+        applicable: count("applicable_available_count").unwrap_or(0),
+    })
 }
 
 fn window_from(value: &Value) -> Window {
@@ -219,6 +234,51 @@ mod tests {
         assert_eq!(account.windows[1].used_percent, Some(10.0));
         assert!(account.windows[1].reset_at.is_none());
         assert!(account.windows[1].reset_after.is_none());
+    }
+
+    #[test]
+    fn maps_banked_reset_credits_and_tolerates_their_absence() {
+        let credits = json!({
+            "rate_limit_reset_credits": {
+                "available_count": 2,
+                "applicable_available_count": 0
+            }
+        });
+        assert_eq!(
+            credits_from(credits.get("rate_limit_reset_credits").unwrap()),
+            Some(Credits {
+                available: 2,
+                applicable: 0
+            })
+        );
+        let without_applicable = json!({"rate_limit_reset_credits": {"available_count": 1}});
+        assert_eq!(
+            credits_from(without_applicable.get("rate_limit_reset_credits").unwrap()),
+            Some(Credits {
+                available: 1,
+                applicable: 0
+            })
+        );
+        for value in [json!({}), json!(null)] {
+            assert_eq!(credits_from(&value), None, "{value}");
+        }
+
+        let fake = Fake::new(json!({
+            "rate_limit_reset_credits": {
+                "available_count": 2,
+                "applicable_available_count": 0
+            }
+        }));
+        let auth = auth();
+        let mut account = Account::from_auth(&auth);
+        fill(&fake, &auth, false, &mut account).unwrap();
+        assert_eq!(
+            account.credits,
+            Some(Credits {
+                available: 2,
+                applicable: 0
+            })
+        );
     }
 
     #[test]

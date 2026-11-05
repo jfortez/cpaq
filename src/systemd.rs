@@ -186,6 +186,7 @@ fn render_service(exec: &str) -> String {
          [Service]\n\
          Type=oneshot\n\
          ExecStart={exec} auto\n\
+         TimeoutStartSec=600\n\
          {REARM}\n"
     )
 }
@@ -216,7 +217,7 @@ fn render_timer(config: &Config) -> String {
          [Timer]\n\
          OnBootSec=90s\n\
          {schedule}\n\
-         AccuracySec=30s\n\
+         AccuracySec=1s\n\
          Persistent=true\n\
          \n\
          [Install]\n\
@@ -340,6 +341,7 @@ mod tests {
              [Service]\n\
              Type=oneshot\n\
              ExecStart=/usr/local/bin/cpaq auto\n\
+             TimeoutStartSec=600\n\
              ExecStopPost=/usr/bin/systemctl --user try-restart tokenmaxx.timer\n"
         );
         assert_eq!(
@@ -350,7 +352,7 @@ mod tests {
              [Timer]\n\
              OnBootSec=90s\n\
              OnCalendar=*:0/5\n\
-             AccuracySec=30s\n\
+             AccuracySec=1s\n\
              Persistent=true\n\
              \n\
              [Install]\n\
@@ -398,7 +400,7 @@ mod tests {
         assert_eq!(timer.matches("OnCalendar=").count(), 1);
         assert!(!timer.contains("OnUnitInactiveSec="));
         assert!(!timer.contains("23:45"));
-        for field in ["OnBootSec=90s", "AccuracySec=30s", "Persistent=true"] {
+        for field in ["OnBootSec=90s", "AccuracySec=1s", "Persistent=true"] {
             assert!(timer.contains(field));
         }
         assert_eq!(
@@ -424,7 +426,7 @@ mod tests {
         assert!(timer.contains("OnCalendar=*-*-* 23:45:00"));
         assert!(timer.contains("OnUnitInactiveSec=3h"));
         assert!(!timer.contains("OnCalendar=*:0/5"));
-        for field in ["OnBootSec=90s", "AccuracySec=30s", "Persistent=true"] {
+        for field in ["OnBootSec=90s", "AccuracySec=1s", "Persistent=true"] {
             assert!(timer.contains(field));
         }
     }
@@ -463,7 +465,7 @@ mod tests {
         for field in [
             "OnBootSec=90s",
             "OnCalendar=*:0/5",
-            "AccuracySec=30s",
+            "AccuracySec=1s",
             "Persistent=true",
         ] {
             assert!(timer.contains(field), "timer lost {field}: {timer}");

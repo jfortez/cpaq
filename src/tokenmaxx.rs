@@ -235,6 +235,22 @@ pub(crate) fn run_output(
     config: &Config,
     stdout: bool,
 ) -> Result<i32, String> {
+    // One ping record per pass, including a pass that could not start.
+    match run_pass(args, paths, config, stdout) {
+        Ok(code) => {
+            journal_ping(args, paths, config, code, None);
+            Ok(code)
+        }
+        Err(error) => {
+            journal_ping(args, paths, config, 1, Some(&error));
+            Err(error)
+        }
+    }
+}
+
+/// Runs one keep-alive pass; the caller journals its outcome and passes the
+/// error through unchanged.
+fn run_pass(args: &Args, paths: &Paths, config: &Config, stdout: bool) -> Result<i32, String> {
     let proxy = config.proxy_credentials(paths)?;
     let path = log_path(args, paths, config);
     let mut file = FileSink::open(&path)?;
@@ -264,6 +280,62 @@ pub(crate) fn run_output(
     } else {
         run_with(args, paths, config, &proxy, &seams, &mut file)
     }
+}
+
+/// Appends this attempt's `ping` record, reading the schedule it left behind.
+fn journal_ping(args: &Args, paths: &Paths, config: &Config, code: i32, error: Option<&str>) {
+    let now = crate::time::now().max(0) as u64;
+    let state = crate::auto::state_summary(&paths.auto_state_file());
+    let model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| config.tokenmaxx.model.clone());
+    let mut record = crate::journal::base("ping", now);
+    let origin = if args.mode == crate::cli::Mode::Auto {
+        "auto"
+    } else {
+        "ping"
+    };
+    record.insert("origin".into(), origin.into());
+    record.insert("trigger".into(), crate::journal::trigger().into());
+    record.insert(
+        "result".into(),
+        if code == 0 && error.is_none() {
+            "ok"
+        } else {
+            "error"
+        }
+        .into(),
+    );
+    record.insert("exit".into(), code.into());
+    record.insert("model".into(), model.into());
+    if let Some(error) = error {
+        record.insert("error".into(), crate::journal::sanitize_error(error).into());
+    }
+    for (field, value) in [
+        (
+            "last_ping_epoch",
+            state.map_or(0, |state| state.last_ping_epoch),
+        ),
+        (
+            "next_due_epoch",
+            state.map_or(0, |state| state.next_due_epoch),
+        ),
+        (
+            "window_reset_epoch",
+            state.map_or(0, |state| state.window_reset_epoch),
+        ),
+        (
+            "long_window_reset_epoch",
+            state.map_or(0, |state| state.long_window_reset_epoch),
+        ),
+    ] {
+        record.insert(field.into(), value.into());
+    }
+    crate::journal::append_or_warn(
+        &crate::journal::path(paths),
+        &[serde_json::Value::Object(record)],
+    );
 }
 
 fn log_path(args: &Args, paths: &Paths, config: &Config) -> PathBuf {

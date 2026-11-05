@@ -1,14 +1,22 @@
 //! Short-lived scheduling with bounded reconciliation of early Codex resets.
 
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::Read,
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::{
     cli::Args,
     config::{Config, atomic_write},
+    journal,
     paths::Paths,
-    quota::{Account, Window},
+    quota::{Account, Credits, Window},
 };
 
 /// Usage at or above this percentage means the window is spent.
@@ -17,8 +25,13 @@ const CAPPED_PERCENT: f64 = 99.5;
 const FRESH_PERCENT: f64 = 1.0;
 /// A reset that moved by more than this many seconds belongs to a new window.
 const RESET_SLACK_SECONDS: u64 = 60;
+/// A due instant this close is waited for inside the same run.
+const WAIT_WINDOW_SECONDS: u64 = 300;
+/// Largest state file read: rejects garbage while leaving room for the
+/// per-account credits snapshot on a large auth directory.
+const STATE_MAX_BYTES: u64 = 16 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 struct State {
     last_ping_epoch: u64,
     next_due_epoch: u64,
@@ -30,6 +43,18 @@ struct State {
     /// Earliest Codex weekly/monthly reset seen: the long-window anchor.
     #[serde(default)]
     long_window_reset_epoch: u64,
+    /// Last banked-reset counts per account, keyed by account id or auth file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credits: BTreeMap<String, Credits>,
+}
+
+/// State facts a ping record needs, without exposing the schedule type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateSummary {
+    pub(crate) last_ping_epoch: u64,
+    pub(crate) next_due_epoch: u64,
+    pub(crate) window_reset_epoch: u64,
+    pub(crate) long_window_reset_epoch: u64,
 }
 
 /// Scheduling facts learned from one Codex quota snapshot.
@@ -54,6 +79,79 @@ struct Report {
     stored_long_window_reset_epoch: Option<u64>,
     provider_long_reset_epoch: Option<u64>,
     state: Option<State>,
+    /// Decision instant, after any precision wait.
+    #[serde(skip)]
+    now: u64,
+    /// Seconds spent waiting for the exact due instant.
+    #[serde(skip)]
+    wait_s: u64,
+    /// Probe snapshot of this run, when one was fetched.
+    #[serde(skip)]
+    accounts: Option<Vec<Account>>,
+    /// Provider movements this run has to journal.
+    #[serde(skip)]
+    reset_changes: Vec<ResetChange>,
+}
+
+/// Injectable wall clock and sleeper, so the precision wait stays testable.
+pub(crate) trait Clock {
+    fn now(&self) -> u64;
+    /// Sleeps up to the exact second `epoch`, sub-second precision included.
+    fn sleep_until(&self, epoch: u64);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> u64 {
+        crate::time::now().max(0) as u64
+    }
+
+    fn sleep_until(&self, epoch: u64) {
+        loop {
+            let target = UNIX_EPOCH + Duration::from_secs(epoch);
+            let Ok(remaining) = target.duration_since(SystemTime::now()) else {
+                return;
+            };
+            if remaining.is_zero() {
+                return;
+            }
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
+/// One provider window that moved since the stored plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Movement {
+    account: String,
+    from: u64,
+    to: u64,
+}
+
+/// One journaled reset event: a window movement or a banked-credit change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResetChange {
+    kind: &'static str,
+    account: String,
+    from: i64,
+    to: i64,
+}
+
+/// What one probe snapshot taught about the stored plan.
+#[derive(Clone, Debug, Default)]
+struct Observed {
+    provider_short: Option<u64>,
+    provider_long: Option<u64>,
+    early_short: Option<Movement>,
+    early_long: Option<Movement>,
+    changes: Vec<ResetChange>,
+}
+
+impl Observed {
+    fn early_reset(&self) -> bool {
+        self.early_short.is_some() || self.early_long.is_some()
+    }
 }
 
 /// Resolve auth and fetch only when the local probe interval has elapsed.
@@ -64,15 +162,40 @@ fn probe(paths: &Paths, config: &Config) -> Result<Vec<Account>, String> {
 
 /// Evaluate local scheduling before resolving credentials or auth files.
 pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
-    let now = crate::time::now().max(0) as u64;
-    let (report, code) = run_with(
+    let outcome = run_clocked(
         config,
         &paths.auto_state_file(),
-        now,
+        &SystemClock,
         args.dry_run,
         || probe(paths, config),
         || crate::tokenmaxx::run_output(args, paths, config, !args.json),
-    )?;
+    );
+    let (report, code) = match outcome {
+        Ok(decided) => decided,
+        Err(error) => {
+            // A failed run is still one tick; the error itself passes through.
+            if !args.dry_run {
+                let now = crate::time::now().max(0) as u64;
+                let state = read_state(&paths.auto_state_file()).ok().flatten();
+                journal::append_or_warn(
+                    &journal::path(paths),
+                    &[error_tick_record(now, &error, state.as_ref())],
+                );
+            }
+            return Err(error);
+        }
+    };
+    let now = report.now;
+    if !args.dry_run {
+        // Journal problems are warned about and never change the outcome.
+        let mut records: Vec<Value> = report
+            .reset_changes
+            .iter()
+            .map(|change| reset_change_record(now, change))
+            .collect();
+        records.push(tick_record(&report, code));
+        journal::append_or_warn(&journal::path(paths), &records);
+    }
     if args.json {
         println!(
             "{}",
@@ -83,20 +206,20 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
             "disabled" => println!("auto: tokenmaxx is disabled"),
             "auto_disabled" => println!("auto: auto mode is disabled"),
             "not_due" => {
-                if let Some(state) = report.state {
+                if let Some(state) = report.state.as_ref() {
                     println!(
-                        "auto: next due {} (in {}m; not due)",
-                        rfc3339(state.next_due_epoch),
-                        state.next_due_epoch.saturating_sub(now).div_ceil(60)
+                        "auto: next due {} (in {}; not due)",
+                        crate::time::rfc3339(state.next_due_epoch),
+                        duration_text(state.next_due_epoch.saturating_sub(now))
                     );
                 }
             }
             "deferred" => {
-                if let Some(state) = report.state {
+                if let Some(state) = report.state.as_ref() {
                     println!(
-                        "auto: deferred until {} (in {}m; every Codex window is spent)",
-                        rfc3339(state.next_due_epoch),
-                        state.next_due_epoch.saturating_sub(now).div_ceil(60)
+                        "auto: deferred until {} (in {}; every Codex window is spent)",
+                        crate::time::rfc3339(state.next_due_epoch),
+                        duration_text(state.next_due_epoch.saturating_sub(now))
                     );
                 }
             }
@@ -119,10 +242,13 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
                 report.stored_long_window_reset_epoch,
                 report.provider_long_reset_epoch,
                 report.early_reset_detected,
-                report.state.map_or(0, |s| s.next_due_epoch),
-                report.state.map_or(0, |s| s.window_reset_epoch),
-                report.state.map_or(0, |s| s.long_window_reset_epoch),
-                report.state.map_or(0, |s| s.last_probe_epoch)
+                report.state.as_ref().map_or(0, |s| s.next_due_epoch),
+                report.state.as_ref().map_or(0, |s| s.window_reset_epoch),
+                report
+                    .state
+                    .as_ref()
+                    .map_or(0, |s| s.long_window_reset_epoch),
+                report.state.as_ref().map_or(0, |s| s.last_probe_epoch)
             );
         }
         if args.dry_run {
@@ -141,18 +267,36 @@ fn read_state(path: &Path) -> Result<Option<State>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("Cannot read auto state".into()),
     };
-    // Reject anything >= 1 KiB, without allocating for an unbounded file.
+    // Reject anything >= the bound, without allocating for an unbounded file.
     let mut bytes = Vec::with_capacity(1024);
-    file.take(1024)
+    file.take(STATE_MAX_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|_| "Cannot read auto state")?;
-    if bytes.len() >= 1024 {
+    if bytes.len() >= STATE_MAX_BYTES as usize {
         return Ok(None);
     }
     Ok(serde_json::from_slice(&bytes).ok())
 }
 
-fn probe_due(state: State, now: u64, minutes: u32) -> bool {
+/// Reads the schedule facts a ping record needs from the state file.
+pub(crate) fn state_summary(path: &Path) -> Option<StateSummary> {
+    read_state(path).ok().flatten().map(|state| StateSummary {
+        last_ping_epoch: state.last_ping_epoch,
+        next_due_epoch: state.next_due_epoch,
+        window_reset_epoch: state.window_reset_epoch,
+        long_window_reset_epoch: state.long_window_reset_epoch,
+    })
+}
+
+/// Seconds this run should wait for an exact due instant (0 when none).
+fn wait_window(state: Option<&State>, now: u64) -> u64 {
+    state
+        .map(|state| state.next_due_epoch.saturating_sub(now))
+        .filter(|wait| (1..=WAIT_WINDOW_SECONDS).contains(wait))
+        .unwrap_or(0)
+}
+
+fn probe_due(state: &State, now: u64, minutes: u32) -> bool {
     minutes != 0
         && now
             >= state
@@ -160,7 +304,7 @@ fn probe_due(state: State, now: u64, minutes: u32) -> bool {
                 .saturating_add(u64::from(minutes) * 60)
 }
 
-fn stored_reset(state: State) -> u64 {
+fn stored_reset(state: &State) -> u64 {
     if state.window_reset_epoch == 0 {
         state.next_due_epoch
     } else {
@@ -261,19 +405,17 @@ pub(crate) fn schedule_from(accounts: &[Account], now: u64) -> Option<Schedule> 
 /// follows. A fresh window whose reset moved later belongs to an account that
 /// can serve a ping now; blocked accounts are skipped, so a weekly cap cannot
 /// trigger an early ping while its 5h window keeps rolling.
-fn reconciliation(
-    state: State,
-    now: u64,
-    accounts: &[Account],
-) -> (Option<u64>, Option<u64>, bool) {
-    let mut provider_short: Option<u64> = None;
-    let mut provider_long: Option<u64> = None;
-    let mut candidate_short: Option<(u64, bool)> = None;
-    let mut candidate_long: Option<(u64, bool)> = None;
+fn reconciliation(state: &State, now: u64, accounts: &[Account]) -> Observed {
+    let mut observed = Observed::default();
+    let mut provider_short: Option<(u64, String)> = None;
+    let mut provider_long: Option<(u64, String)> = None;
+    let mut candidate_short: Option<(u64, bool, String)> = None;
+    let mut candidate_long: Option<(u64, bool, String)> = None;
     for account in accounts
         .iter()
         .filter(|account| account.provider == "codex" && account.error.is_none())
     {
+        let key = account_key(account);
         let blocked = account.limit_reached == Some(true)
             || account.allowed == Some(false)
             || account
@@ -284,42 +426,152 @@ fn reconciliation(
             let Some(reset) = epoch_of(window) else {
                 continue;
             };
-            let five_hour = is_five_hour(window);
-            let (provider, candidate) = if five_hour {
+            let (provider, candidate) = if is_five_hour(window) {
                 (&mut provider_short, &mut candidate_short)
             } else {
                 (&mut provider_long, &mut candidate_long)
             };
-            *provider = Some((*provider).map_or(reset, |seen| seen.min(reset)));
+            if provider.as_ref().is_none_or(|(seen, _)| reset < *seen) {
+                *provider = Some((reset, key.clone()));
+            }
             if blocked {
                 continue;
             }
-            if candidate.is_none_or(|(seen, _)| reset < seen) {
-                *candidate = Some((reset, fresh(window)));
+            if candidate.as_ref().is_none_or(|(seen, _, _)| reset < *seen) {
+                *candidate = Some((reset, fresh(window), key.clone()));
             }
         }
     }
-    let early = |candidate: Option<(u64, bool)>, anchor: u64| {
-        candidate.is_some_and(|(reset, fresh)| {
-            fresh && anchor > 0 && reset > anchor.saturating_add(RESET_SLACK_SECONDS) && reset > now
-        })
+    let movement = |candidate: Option<(u64, bool, String)>, anchor: u64| {
+        candidate
+            .filter(|(reset, fresh, _)| {
+                *fresh
+                    && anchor > 0
+                    && *reset > anchor.saturating_add(RESET_SLACK_SECONDS)
+                    && *reset > now
+            })
+            .map(|(reset, _, account)| Movement {
+                account,
+                from: anchor,
+                to: reset,
+            })
     };
-    (
-        provider_short,
-        provider_long,
-        early(candidate_short, stored_reset(state))
-            || early(candidate_long, state.long_window_reset_epoch),
-    )
+    let shortened = |provider: &Option<(u64, String)>, anchor: u64| {
+        provider
+            .as_ref()
+            .filter(|(reset, _)| {
+                anchor > RESET_SLACK_SECONDS && *reset < anchor.saturating_sub(RESET_SLACK_SECONDS)
+            })
+            .map(|(reset, account)| Movement {
+                account: account.clone(),
+                from: anchor,
+                to: *reset,
+            })
+    };
+    observed.provider_short = provider_short.as_ref().map(|(reset, _)| *reset);
+    observed.provider_long = provider_long.as_ref().map(|(reset, _)| *reset);
+    observed.early_short = movement(candidate_short, stored_reset(state));
+    observed.early_long = movement(candidate_long, state.long_window_reset_epoch);
+    observed.changes = [
+        observed
+            .early_short
+            .as_ref()
+            .map(|movement| movement.reset_change("window_reopened_early")),
+        observed
+            .early_long
+            .as_ref()
+            .map(|movement| movement.reset_change("long_window_reopened_early")),
+        shortened(&provider_short, stored_reset(state))
+            .map(|movement| movement.reset_change("window_shortened")),
+        shortened(&provider_long, state.long_window_reset_epoch)
+            .map(|movement| movement.reset_change("window_shortened")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    observed
 }
 
-fn run_with(
+impl Movement {
+    fn reset_change(&self, kind: &'static str) -> ResetChange {
+        ResetChange {
+            kind,
+            account: self.account.clone(),
+            from: self.from as i64,
+            to: self.to as i64,
+        }
+    }
+}
+
+/// Everything one probe snapshot teaches about the stored plan.
+fn observe(state: &mut State, now: u64, accounts: &[Account]) -> Observed {
+    let mut observed = reconciliation(state, now, accounts);
+    observed.changes.extend(credits_diff(state, accounts));
+    observed
+}
+
+/// Diffs banked-reset counts against the stored snapshot and keeps the new one.
+fn credits_diff(state: &mut State, accounts: &[Account]) -> Vec<ResetChange> {
+    let mut changes = Vec::new();
+    for account in accounts
+        .iter()
+        .filter(|account| account.provider == "codex")
+    {
+        let Some(credits) = account.credits else {
+            continue;
+        };
+        let key = account_key(account);
+        let Some(previous) = state.credits.insert(key.clone(), credits) else {
+            continue;
+        };
+        let change = |kind, from: u32, to: u32| ResetChange {
+            kind,
+            account: key.clone(),
+            from: from.into(),
+            to: to.into(),
+        };
+        if credits.available < previous.available {
+            changes.push(change(
+                "banked_reset_used",
+                previous.available,
+                credits.available,
+            ));
+        } else if credits.available > previous.available {
+            changes.push(change(
+                "banked_reset_earned",
+                previous.available,
+                credits.available,
+            ));
+        }
+        if credits.applicable != previous.applicable {
+            changes.push(change(
+                "banked_reset_applicable",
+                previous.applicable,
+                credits.applicable,
+            ));
+        }
+    }
+    changes
+}
+
+/// Stable per-account journal key: the provider account id, else the auth file.
+fn account_key(account: &Account) -> String {
+    account
+        .account_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| account.file.clone())
+}
+
+fn run_clocked(
     config: &Config,
     path: &Path,
-    now: u64,
+    clock: &dyn Clock,
     dry_run: bool,
     probe: impl FnOnce() -> Result<Vec<Account>, String>,
     ping: impl FnOnce() -> Result<i32, String>,
 ) -> Result<(Report, i32), String> {
+    let mut now = clock.now();
     let mut report = Report {
         decision: "disabled",
         dry_run,
@@ -330,6 +582,10 @@ fn run_with(
         stored_long_window_reset_epoch: None,
         provider_long_reset_epoch: None,
         state: None,
+        now,
+        wait_s: 0,
+        accounts: None,
+        reset_changes: Vec::new(),
     };
     if !config.tokenmaxx.enabled {
         return Ok((report, 0));
@@ -338,22 +594,40 @@ fn run_with(
         report.decision = "auto_disabled";
         return Ok((report, 0));
     }
-    report.state = read_state(path)?;
-    if let Some(mut state) = report.state.filter(|s| now < s.next_due_epoch) {
+    let mut state = read_state(path)?;
+    // A due instant inside the wait window is pinged at its exact second.
+    if !dry_run {
+        report.wait_s = wait_window(state.as_ref(), now);
+        if report.wait_s > 0 {
+            if let Some(state) = state.as_ref() {
+                clock.sleep_until(state.next_due_epoch);
+            }
+            now = clock.now();
+            report.now = now;
+            // Re-read both sides: a manual ping may have opened a new window.
+            state = read_state(path)?;
+        }
+    }
+    report.state = state;
+    if let Some(mut state) = report
+        .state
+        .clone()
+        .filter(|state| now < state.next_due_epoch)
+    {
         report.decision = "not_due";
-        report.stored_window_reset_epoch = Some(stored_reset(state)).filter(|reset| *reset > 0);
+        report.stored_window_reset_epoch = Some(stored_reset(&state)).filter(|reset| *reset > 0);
         report.stored_long_window_reset_epoch =
             Some(state.long_window_reset_epoch).filter(|reset| *reset > 0);
-        report.probe_due = probe_due(state, now, config.tokenmaxx.probe_minutes);
+        report.probe_due = probe_due(&state, now, config.tokenmaxx.probe_minutes);
         if !report.probe_due {
             return Ok((report, 0));
         }
         if let Ok(accounts) = probe() {
-            (
-                report.provider_reset_epoch,
-                report.provider_long_reset_epoch,
-                report.early_reset_detected,
-            ) = reconciliation(state, now, &accounts);
+            let observed = observe(&mut state, now, &accounts);
+            report.provider_reset_epoch = observed.provider_short;
+            report.provider_long_reset_epoch = observed.provider_long;
+            report.early_reset_detected = observed.early_reset();
+            report.reset_changes = observed.changes;
             // The provider can also reopen earlier than the stored plan.
             if !report.early_reset_detected
                 && let Some(schedule) = schedule_from(&accounts, now)
@@ -362,11 +636,13 @@ fn run_with(
             {
                 state.next_due_epoch = schedule.next_due_epoch;
             }
+            report.accounts = Some(accounts);
         }
         state.last_probe_epoch = now;
+        let credits = state.credits.clone();
         // Persist the attempt even on provider errors or a failed keep-alive.
         if !dry_run {
-            write_state(path, state)?;
+            write_state(path, &state)?;
         }
         report.state = Some(state);
         if !report.early_reset_detected {
@@ -374,14 +650,16 @@ fn run_with(
         }
         report.decision = "early_reset";
         if dry_run {
-            report.state = Some(scheduled_state(
+            let state = scheduled_state(
                 now,
                 config.tokenmaxx.interval_hours,
                 schedule_for_reset(
                     report.provider_reset_epoch,
                     report.provider_long_reset_epoch,
                 ),
-            )?);
+            )?
+            .keep_credits(&credits);
+            report.state = Some(state);
             return Ok((report, 0));
         }
         let code = ping()?;
@@ -389,24 +667,26 @@ fn run_with(
             // The pass re-anchors both windows from its own post-ping snapshot;
             // fall back to the detected window when that snapshot was unavailable.
             let saved = read_state(path)?;
-            report.state = Some(match saved.filter(|state| state.window_reset_epoch > 0) {
-                Some(state) => {
-                    let mut state = state;
+            let last_ping = saved.as_ref().map_or(now, |state| state.last_ping_epoch);
+            let anchored = saved.and_then(|state| (state.window_reset_epoch > 0).then_some(state));
+            report.state = Some(match anchored {
+                Some(mut state) => {
                     state.last_probe_epoch = now;
-                    write_state(path, state)?;
+                    write_state(path, &state)?;
                     state
                 }
                 None => {
                     let mut state = scheduled_state(
-                        saved.map_or(now, |state| state.last_ping_epoch),
+                        last_ping,
                         config.tokenmaxx.interval_hours,
                         schedule_for_reset(
                             report.provider_reset_epoch,
                             report.provider_long_reset_epoch,
                         ),
-                    )?;
+                    )?
+                    .keep_credits(&credits);
                     state.last_probe_epoch = now;
-                    write_state(path, state)?;
+                    write_state(path, &state)?;
                     state
                 }
             });
@@ -421,9 +701,11 @@ fn run_with(
         let code = ping()?;
         report.state = read_state(path)?;
         if code != 0
-            && let Some(deferred) = defer_while_capped(path, now, report.state, probe())?
+            && let Some((deferred, changes)) =
+                defer_while_capped(path, now, report.state.as_ref(), probe())?
         {
             report.state = Some(deferred);
+            report.reset_changes = changes;
             report.decision = "deferred";
         }
         code
@@ -447,9 +729,9 @@ fn schedule_for_reset(short: Option<u64>, long: Option<u64>) -> Option<Schedule>
 fn defer_while_capped(
     path: &Path,
     now: u64,
-    previous: Option<State>,
+    previous: Option<&State>,
     accounts: Result<Vec<Account>, String>,
-) -> Result<Option<State>, String> {
+) -> Result<Option<(State, Vec<ResetChange>)>, String> {
     let Ok(accounts) = accounts else {
         return Ok(None);
     };
@@ -475,15 +757,26 @@ fn defer_while_capped(
     else {
         return Ok(None);
     };
+    let mut plan = previous.cloned().unwrap_or_default();
+    let observed = observe(&mut plan, now, &accounts);
     let state = State {
         last_ping_epoch: previous.map_or(0, |state| state.last_ping_epoch),
         next_due_epoch: schedule.next_due_epoch,
         last_probe_epoch: now,
         window_reset_epoch: schedule.window_reset_epoch,
         long_window_reset_epoch: schedule.long_window_reset_epoch,
+        credits: plan.credits,
     };
-    write_state(path, state)?;
-    Ok(Some(state))
+    write_state(path, &state)?;
+    Ok(Some((state, observed.changes)))
+}
+
+impl State {
+    /// Keeps the last banked-credit snapshot across a fresh schedule.
+    fn keep_credits(mut self, credits: &BTreeMap<String, Credits>) -> Self {
+        self.credits.clone_from(credits);
+        self
+    }
 }
 
 fn scheduled_state(
@@ -503,11 +796,12 @@ fn scheduled_state(
         last_probe_epoch: now,
         window_reset_epoch: schedule.map_or(0, |schedule| schedule.window_reset_epoch),
         long_window_reset_epoch: schedule.map_or(0, |schedule| schedule.long_window_reset_epoch),
+        credits: BTreeMap::new(),
     })
 }
 
-fn write_state(path: &Path, state: State) -> Result<(), String> {
-    let bytes = serde_json::to_vec(&state).map_err(|_| "Cannot serialize auto state")?;
+fn write_state(path: &Path, state: &State) -> Result<(), String> {
+    let bytes = serde_json::to_vec(state).map_err(|_| "Cannot serialize auto state")?;
     atomic_write(path, &bytes).map_err(|_| "Cannot save auto state atomically".into())
 }
 
@@ -518,25 +812,181 @@ pub(crate) fn record_success(
     interval_hours: u32,
     schedule: Option<Schedule>,
 ) -> Result<(), String> {
-    write_state(path, scheduled_state(now, interval_hours, schedule)?)
+    let credits = read_state(path)?.map_or_else(BTreeMap::new, |state| state.credits);
+    let state = scheduled_state(now, interval_hours, schedule)?.keep_credits(&credits);
+    write_state(path, &state)
 }
 
-fn rfc3339(epoch: u64) -> String {
-    let Ok(epoch) = i64::try_from(epoch) else {
-        return "?".into();
-    };
-    let mut text = crate::time::local(epoch, "%Y-%m-%dT%H:%M:%S%z");
-    if text.len() >= 5 {
-        text.insert(text.len() - 2, ':');
+/// Seconds as `4h 59m 24s`, so an idle gap is readable at a glance.
+fn duration_text(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
     }
-    text
+}
+
+/// The single `tick` record every non-dry-run run appends.
+fn tick_record(report: &Report, code: i32) -> Value {
+    let now = report.now;
+    let state = report.state.as_ref();
+    let next_due = state.map_or(0, |state| state.next_due_epoch);
+    let mut record = journal::base("tick", now);
+    record.insert("decision".into(), report.decision.into());
+    record.insert("trigger".into(), journal::trigger().into());
+    record.insert(
+        "last_ping_epoch".into(),
+        state.map_or(0, |state| state.last_ping_epoch).into(),
+    );
+    record.insert("next_due_epoch".into(), next_due.into());
+    record.insert("due_in_s".into(), (next_due as i64 - now as i64).into());
+    record.insert("probe_due".into(), report.probe_due.into());
+    if report.wait_s > 0 {
+        record.insert("wait_s".into(), report.wait_s.into());
+    }
+    record.insert("exit".into(), code.into());
+    if let Some(accounts) = report.accounts.as_ref() {
+        record.insert(
+            "stored_5h".into(),
+            optional(report.stored_window_reset_epoch),
+        );
+        record.insert("provider_5h".into(), optional(report.provider_reset_epoch));
+        record.insert(
+            "stored_long".into(),
+            optional(report.stored_long_window_reset_epoch),
+        );
+        record.insert(
+            "provider_long".into(),
+            optional(report.provider_long_reset_epoch),
+        );
+        record.insert("early_reset".into(), report.early_reset_detected.into());
+        record.insert(
+            "accounts".into(),
+            accounts
+                .iter()
+                .map(account_record)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    Value::Object(record)
+}
+
+/// The tick of a run that could not decide: same record shape, plus the error.
+fn error_tick_record(now: u64, error: &str, state: Option<&State>) -> Value {
+    let mut record = journal::base("tick", now);
+    record.insert("decision".into(), "error".into());
+    record.insert("trigger".into(), journal::trigger().into());
+    record.insert("exit".into(), 1.into());
+    record.insert("error".into(), journal::sanitize_error(error).into());
+    if let Some(state) = state {
+        record.insert("last_ping_epoch".into(), state.last_ping_epoch.into());
+        record.insert("next_due_epoch".into(), state.next_due_epoch.into());
+        record.insert(
+            "due_in_s".into(),
+            (state.next_due_epoch as i64 - now as i64).into(),
+        );
+    }
+    Value::Object(record)
+}
+
+fn reset_change_record(now: u64, change: &ResetChange) -> Value {
+    let mut record = journal::base("reset_change", now);
+    record.insert("kind".into(), change.kind.into());
+    record.insert("account".into(), change.account.clone().into());
+    record.insert("from".into(), change.from.into());
+    record.insert("to".into(), change.to.into());
+    Value::Object(record)
+}
+
+/// Journal view of one probe account; never carries credentials.
+fn account_record(account: &Account) -> Value {
+    let mut record = Map::new();
+    record.insert("file".into(), account.file.clone().into());
+    record.insert("email".into(), optional(account.email.clone()));
+    record.insert("plan".into(), optional(account.plan.clone()));
+    record.insert("allowed".into(), optional(account.allowed));
+    record.insert("limit_reached".into(), optional(account.limit_reached));
+    record.insert("error".into(), optional(account.error.clone()));
+    record.insert(
+        "windows".into(),
+        account
+            .windows
+            .iter()
+            .map(|window| {
+                let mut value = Map::new();
+                value.insert("label".into(), window.label.clone().into());
+                value.insert("used_percent".into(), optional(window.used_percent));
+                value.insert("reset_at".into(), optional(window.reset_at.clone()));
+                value.insert("reset_after".into(), optional(window.reset_after));
+                Value::Object(value)
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    record.insert(
+        "credits".into(),
+        account.credits.map_or(Value::Null, |credits| {
+            let mut value = Map::new();
+            value.insert("available".into(), credits.available.into());
+            value.insert("applicable".into(), credits.applicable.into());
+            Value::Object(value)
+        }),
+    );
+    Value::Object(record)
+}
+
+fn optional<T: Into<Value>>(value: Option<T>) -> Value {
+    value.map_or(Value::Null, Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::Sandbox;
-    use std::{cell::Cell, fs, os::unix::fs::PermissionsExt};
+    use std::{
+        cell::{Cell, RefCell},
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
+
+    /// Fixed clock: existing tests never enter the precision wait.
+    struct FixedClock(u64);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> u64 {
+            self.0
+        }
+
+        fn sleep_until(&self, _epoch: u64) {
+            panic!("a fixed clock must never sleep");
+        }
+    }
+
+    /// Injects a fixed decision instant; the wait window stays for run_clocked.
+    fn run_with(
+        config: &Config,
+        path: &Path,
+        now: u64,
+        dry_run: bool,
+        probe: impl FnOnce() -> Result<Vec<Account>, String>,
+        ping: impl FnOnce() -> Result<i32, String>,
+    ) -> Result<(Report, i32), String> {
+        run_clocked(config, path, &FixedClock(now), dry_run, probe, ping)
+    }
+
+    /// Tuple view used by the reconciliation tests.
+    fn check(state: &State, now: u64, accounts: &[Account]) -> (Option<u64>, Option<u64>, bool) {
+        let observed = reconciliation(state, now, accounts);
+        (
+            observed.provider_short,
+            observed.provider_long,
+            observed.early_reset(),
+        )
+    }
 
     fn run_local(
         config: &Config,
@@ -576,7 +1026,8 @@ mod tests {
                 next_due_epoch: 18100,
                 last_probe_epoch: 100,
                 window_reset_epoch: 0,
-                long_window_reset_epoch: 0
+                long_window_reset_epoch: 0,
+                credits: BTreeMap::new()
             })
         );
         assert!(fs::metadata(&path).unwrap().len() < 1024);
@@ -614,7 +1065,8 @@ mod tests {
                 next_due_epoch: 500,
                 last_probe_epoch: 101,
                 window_reset_epoch: 500,
-                long_window_reset_epoch: 0
+                long_window_reset_epoch: 0,
+                credits: BTreeMap::new()
             })
         );
         assert_eq!(read_state(&path).unwrap(), report.state);
@@ -658,7 +1110,8 @@ mod tests {
     fn future_state_is_not_due_and_never_calls_pass_or_writes() {
         let s = Sandbox::default();
         let path = s.0.join("auto.json");
-        let bytes = br#"{"last_ping_epoch":0,"next_due_epoch":101}"#;
+        // Beyond the precision wait window, so no clock sleep is attempted.
+        let bytes = br#"{"last_ping_epoch":0,"next_due_epoch":1001}"#;
         fs::write(&path, bytes).unwrap();
         let (report, code) = run_local(&Config::default(), &path, 100, false, || {
             panic!("idle path called ping")
@@ -666,7 +1119,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.decision, "not_due");
         assert_eq!(code, 0);
-        assert_eq!(report.state.unwrap().next_due_epoch, 101);
+        assert_eq!(report.state.unwrap().next_due_epoch, 1001);
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
@@ -674,17 +1127,35 @@ mod tests {
     fn oversized_state_is_corrupt_and_read_is_bounded() {
         let s = Sandbox::default();
         let path = s.0.join("auto.json");
-        let bytes = format!(
-            "{{\"last_ping_epoch\":0,\"next_due_epoch\":1000}}{}",
-            " ".repeat(1024)
-        );
-        fs::write(&path, bytes).unwrap();
+        // A state that outgrew the bound must never be parsed as a plan.
+        fs::write(&path, " ".repeat(STATE_MAX_BYTES as usize + 1)).unwrap();
         let (report, _) = run_local(&Config::default(), &path, 100, true, || {
             panic!("dry-run called ping")
         })
         .unwrap();
         assert_eq!(report.decision, "due");
         assert_eq!(report.state.unwrap().next_due_epoch, 18100);
+    }
+
+    #[test]
+    fn state_with_many_credit_snapshots_still_parses() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        let mut state = plan(20000, 1000);
+        for index in 0..60 {
+            state.credits.insert(
+                format!("acct-{index:02}"),
+                Credits {
+                    available: 2,
+                    applicable: 0,
+                },
+            );
+        }
+        write_state(&path, &state).unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(size > 1024, "the fixture must exceed the old 1 KiB bound");
+        assert!(size < STATE_MAX_BYTES, "the fixture must fit the new bound");
+        assert_eq!(read_state(&path).unwrap(), Some(state));
     }
 
     #[test]
@@ -728,7 +1199,8 @@ mod tests {
                 next_due_epoch: 10900,
                 last_probe_epoch: 100,
                 window_reset_epoch: 0,
-                long_window_reset_epoch: 0
+                long_window_reset_epoch: 0,
+                credits: BTreeMap::new()
             })
         );
         assert_eq!(code, 0);
@@ -767,6 +1239,7 @@ mod tests {
             last_probe_epoch: 1000,
             window_reset_epoch: 20000,
             long_window_reset_epoch: 0,
+            credits: BTreeMap::new(),
         }
     }
 
@@ -777,6 +1250,7 @@ mod tests {
             last_probe_epoch: 100,
             window_reset_epoch: next_due_epoch,
             long_window_reset_epoch: 0,
+            credits: BTreeMap::new(),
         }
     }
 
@@ -817,10 +1291,10 @@ mod tests {
     #[test]
     fn probe_interval_bounds_and_zero_disables() {
         let state = future_state();
-        assert!(!probe_due(state, 1899, 15));
-        assert!(probe_due(state, 1900, 15));
-        assert!(probe_due(state, 2000, 15));
-        assert!(!probe_due(state, u64::MAX, 0));
+        assert!(!probe_due(&state, 1899, 15));
+        assert!(probe_due(&state, 1900, 15));
+        assert!(probe_due(&state, 2000, 15));
+        assert!(!probe_due(&state, u64::MAX, 0));
     }
 
     #[test]
@@ -841,14 +1315,11 @@ mod tests {
             (21000, None, false),
         ] {
             let a = account(reset.into(), usage);
-            assert_eq!(
-                reconciliation(state, 2000, &[a]),
-                (Some(reset), None, expected)
-            );
+            assert_eq!(check(&state, 2000, &[a]), (Some(reset), None, expected));
         }
         let a = account(21000.into(), Some(0.0));
         assert_eq!(
-            reconciliation(state, 22000, std::slice::from_ref(&a)),
+            check(&state, 22000, std::slice::from_ref(&a)),
             (Some(21000), None, false)
         );
         for kind in ["error", "limit", "blocked", "other"] {
@@ -859,34 +1330,31 @@ mod tests {
                 "blocked" => a.allowed = Some(false),
                 _ => a.provider = "claude".into(),
             }
-            assert!(!reconciliation(state, 2000, &[a]).2, "{kind}");
+            assert!(!check(&state, 2000, &[a]).2, "{kind}");
         }
         // A weekly window is compared with the long anchor, never the 5h one.
         let weekly = codex(vec![window("7d", 21000, 0.0)]);
         assert_eq!(
-            reconciliation(state, 2000, std::slice::from_ref(&weekly)),
+            check(&state, 2000, std::slice::from_ref(&weekly)),
             (None, Some(21000), false)
         );
-        let mut anchored = state;
+        let mut anchored = state.clone();
         anchored.long_window_reset_epoch = 20000;
-        assert!(reconciliation(anchored, 2000, std::slice::from_ref(&weekly)).2);
+        assert!(check(&anchored, 2000, std::slice::from_ref(&weekly)).2);
         let legacy = State {
             window_reset_epoch: 0,
-            ..state
+            ..state.clone()
         };
-        assert!(reconciliation(legacy, 2000, std::slice::from_ref(&a)).2);
+        assert!(check(&legacy, 2000, std::slice::from_ref(&a)).2);
         let mut iso = a.clone();
         iso.windows[0].reset_at = Some("1970-01-01T05:50:00Z".into());
-        assert_eq!(
-            reconciliation(state, 2000, &[iso]),
-            (Some(21000), None, true)
-        );
+        assert_eq!(check(&state, 2000, &[iso]), (Some(21000), None, true));
         // A spent account is skipped, but does not veto the healthy one.
         let mut limited = a.clone();
         limited.limit_reached = Some(true);
-        assert!(reconciliation(state, 2000, &[a.clone(), limited]).2);
+        assert!(check(&state, 2000, &[a.clone(), limited]).2);
         assert_eq!(
-            reconciliation(state, 2000, &[a, account(20000.into(), Some(0.0))]),
+            check(&state, 2000, &[a, account(20000.into(), Some(0.0))]),
             (Some(20000), None, false)
         );
     }
@@ -1018,8 +1486,9 @@ mod tests {
             last_probe_epoch: 2000,
             window_reset_epoch: 5000,
             long_window_reset_epoch: 9000,
+            credits: BTreeMap::new(),
         };
-        assert_eq!(report.state, Some(expected));
+        assert_eq!(report.state.as_ref(), Some(&expected));
         assert_eq!(read_state(&path).unwrap(), Some(expected));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1028,7 +1497,7 @@ mod tests {
 
         // Live shape: the weekly reset is minutes away while the fresh 5h window
         // would reopen hours later, so the deferral must land on the weekly reset.
-        write_state(&path, state_with_due(1500)).unwrap();
+        write_state(&path, &state_with_due(1500)).unwrap();
         let team = codex(vec![window("5h", 20000, 0.0), window("7d", 2360, 100.0)]);
         let (report, code) = run_with(
             &Config::default(),
@@ -1088,7 +1557,7 @@ mod tests {
             long_window_reset_epoch: 20000,
             ..future_state()
         };
-        write_state(&path, state).unwrap();
+        write_state(&path, &state).unwrap();
         let calls = Cell::new(0);
         let (report, code) = run_with(
             &Config::default(),
@@ -1131,8 +1600,9 @@ mod tests {
             last_probe_epoch: 2000,
             window_reset_epoch: 21000,
             long_window_reset_epoch: 40000,
+            credits: BTreeMap::new(),
         };
-        assert_eq!(report.state, Some(expected));
+        assert_eq!(report.state.as_ref(), Some(&expected));
         assert_eq!(read_state(&path).unwrap(), Some(expected));
     }
 
@@ -1144,7 +1614,7 @@ mod tests {
             long_window_reset_epoch: 20000,
             ..future_state()
         };
-        write_state(&path, state).unwrap();
+        write_state(&path, &state).unwrap();
         let before = fs::read(&path).unwrap();
         let (report, code) = run_with(
             &Config::default(),
@@ -1172,7 +1642,7 @@ mod tests {
     fn probe_tightens_a_later_due_time_when_the_provider_reopens_sooner() {
         let sandbox = Sandbox::default();
         let path = sandbox.0.join("auto.json");
-        write_state(&path, future_state()).unwrap();
+        write_state(&path, &future_state()).unwrap();
         let (report, code) = run_with(
             &Config::default(),
             &path,
@@ -1207,7 +1677,7 @@ mod tests {
             }]),
         ];
         for outcome in outcomes {
-            write_state(&path, state).unwrap();
+            write_state(&path, &state).unwrap();
             let (report, code) = run_with(
                 &Config::default(),
                 &path,
@@ -1219,13 +1689,13 @@ mod tests {
             .unwrap();
             let expected = State {
                 last_probe_epoch: 2000,
-                ..state
+                ..state.clone()
             };
             assert_eq!(code, 0);
             assert!(report.probe_due);
             assert!(!report.early_reset_detected);
             assert_eq!(report.decision, "not_due");
-            assert_eq!(report.state, Some(expected));
+            assert_eq!(report.state.as_ref(), Some(&expected));
             assert_eq!(read_state(&path).unwrap(), Some(expected));
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1241,7 +1711,7 @@ mod tests {
         let path = sandbox.0.join("auto.json");
         let state = future_state();
         for (dry_run, ping_code) in [(true, 0), (false, 0), (false, 1)] {
-            write_state(&path, state).unwrap();
+            write_state(&path, &state).unwrap();
             let before = fs::read(&path).unwrap();
             let calls = Cell::new(0);
             let (report, code) = run_with(
@@ -1274,7 +1744,7 @@ mod tests {
             assert!(report.early_reset_detected);
             assert_eq!(report.provider_reset_epoch, Some(21000));
             assert_eq!(report.stored_window_reset_epoch, Some(20000));
-            let after = report.state.unwrap();
+            let after = report.state.clone().unwrap();
             assert_eq!(after.last_probe_epoch, 2000);
             assert_eq!(
                 after.next_due_epoch,
@@ -1296,7 +1766,7 @@ mod tests {
     fn early_reset_keeps_the_post_ping_schedule_from_the_pass() {
         let sandbox = Sandbox::default();
         let path = sandbox.0.join("auto.json");
-        write_state(&path, future_state()).unwrap();
+        write_state(&path, &future_state()).unwrap();
         let (report, code) = run_with(
             &Config::default(),
             &path,
@@ -1327,8 +1797,9 @@ mod tests {
             last_probe_epoch: 2000,
             window_reset_epoch: 25000,
             long_window_reset_epoch: 90000,
+            credits: BTreeMap::new(),
         };
-        assert_eq!(report.state, Some(expected));
+        assert_eq!(report.state.as_ref(), Some(&expected));
         assert_eq!(read_state(&path).unwrap(), Some(expected));
     }
 
@@ -1354,7 +1825,8 @@ mod tests {
                 next_due_epoch: 7000,
                 last_probe_epoch: 100,
                 window_reset_epoch: 6000,
-                long_window_reset_epoch: 7000
+                long_window_reset_epoch: 7000,
+                credits: BTreeMap::new()
             })
         );
         record_success(&path, 100, 5, Some(Schedule::default())).unwrap();
@@ -1366,7 +1838,7 @@ mod tests {
         let sandbox = Sandbox::default();
         let path = sandbox.0.join("auto.json");
         let state = future_state();
-        write_state(&path, state).unwrap();
+        write_state(&path, &state).unwrap();
         let before = fs::read(&path).unwrap();
         for (minutes, now) in [(0, 2000), (15, 1899)] {
             let mut config = Config::default();
@@ -1385,5 +1857,419 @@ mod tests {
             assert!(!report.probe_due);
             assert_eq!(fs::read(&path).unwrap(), before);
         }
+    }
+
+    /// Clock that advances instantly, and can simulate a manual ping mid-wait.
+    struct TestClock {
+        now: Cell<u64>,
+        slept: RefCell<Vec<u64>>,
+        after_sleep: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    impl TestClock {
+        fn at(now: u64) -> Self {
+            Self {
+                now: Cell::new(now),
+                slept: RefCell::new(Vec::new()),
+                after_sleep: RefCell::new(None),
+            }
+        }
+
+        fn slept(&self) -> Vec<u64> {
+            self.slept.borrow().clone()
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> u64 {
+            self.now.get()
+        }
+
+        fn sleep_until(&self, epoch: u64) {
+            self.slept.borrow_mut().push(epoch);
+            self.now.set(epoch);
+            if let Some(callback) = self.after_sleep.borrow_mut().take() {
+                callback();
+            }
+        }
+    }
+
+    /// A stored plan whose probe is not due, so the first decision is the wait.
+    fn plan(next_due_epoch: u64, now: u64) -> State {
+        State {
+            last_ping_epoch: 0,
+            next_due_epoch,
+            last_probe_epoch: now,
+            window_reset_epoch: next_due_epoch,
+            long_window_reset_epoch: 0,
+            credits: BTreeMap::new(),
+        }
+    }
+
+    fn codex_account(windows: Vec<Window>, credits: Option<Credits>) -> Account {
+        Account {
+            file: "codex.json".into(),
+            provider: "codex".into(),
+            allowed: Some(true),
+            limit_reached: Some(false),
+            windows,
+            credits,
+            ..Default::default()
+        }
+    }
+
+    fn credited(account_id: &str, available: u32, applicable: u32) -> Account {
+        Account {
+            account_id: Some(account_id.into()),
+            credits: Some(Credits {
+                available,
+                applicable,
+            }),
+            ..codex_account(vec![window("5h", 20000, 40.0)], None)
+        }
+    }
+
+    /// One probe run; returns what the run would journal.
+    fn probe_run(path: &Path, now: u64, accounts: Vec<Account>) -> Vec<ResetChange> {
+        let (report, _) = run_with(
+            &Config::default(),
+            path,
+            now,
+            false,
+            move || Ok(accounts),
+            || Ok(0),
+        )
+        .unwrap();
+        report.reset_changes
+    }
+
+    #[test]
+    fn precision_wait_pings_at_the_exact_due_second() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(1700, 1000)).unwrap();
+        // A five-minute tick fires 24s before the due second.
+        let clock = TestClock::at(1676);
+        let calls = Cell::new(0);
+        let (report, code) = run_clocked(
+            &Config::default(),
+            &path,
+            &clock,
+            false,
+            || panic!("the precision wait is not a probe"),
+            || {
+                calls.set(calls.get() + 1);
+                assert_eq!(clock.now(), 1700, "the ping must land on the due second");
+                record_success(&path, clock.now(), 5, None)?;
+                Ok(0)
+            },
+        )
+        .unwrap();
+        assert_eq!(clock.slept(), vec![1700]);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(code, 0);
+        assert_eq!(report.decision, "due");
+        assert_eq!(report.wait_s, 24);
+        assert_eq!(read_state(&path).unwrap().unwrap().last_ping_epoch, 1700);
+    }
+
+    #[test]
+    fn manual_ping_during_the_wait_wins() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(1700, 1000)).unwrap();
+        let clock = TestClock::at(1676);
+        let next = path.clone();
+        *clock.after_sleep.borrow_mut() = Some(Box::new(move || {
+            // A manual `cpaq ping` opened a new window while auto waited.
+            let opened = State {
+                last_ping_epoch: 1700,
+                next_due_epoch: 20000,
+                last_probe_epoch: 1700,
+                window_reset_epoch: 20000,
+                ..plan(20000, 1700)
+            };
+            write_state(&next, &opened).unwrap();
+        }));
+        let (report, code) = run_clocked(
+            &Config::default(),
+            &path,
+            &clock,
+            false,
+            || panic!("a fresh window is not a probe"),
+            || panic!("a manual ping must suppress the auto ping"),
+        )
+        .unwrap();
+        assert_eq!(clock.slept(), vec![1700]);
+        assert_eq!(code, 0);
+        assert_eq!(report.decision, "not_due");
+        assert_eq!(read_state(&path).unwrap().unwrap().next_due_epoch, 20000);
+    }
+
+    #[test]
+    fn dry_run_never_waits_or_writes() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(1705, 1000)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let clock = TestClock::at(1700);
+        let (report, code) = run_clocked(
+            &Config::default(),
+            &path,
+            &clock,
+            true,
+            || panic!("dry-run must not probe"),
+            || panic!("dry-run must not ping"),
+        )
+        .unwrap();
+        assert!(clock.slept().is_empty(), "dry-run must not sleep");
+        // Without the wait the run can only report the idle decision.
+        assert_eq!(report.decision, "not_due");
+        assert_eq!(report.wait_s, 0);
+        assert_eq!(code, 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn far_due_is_not_waited_for() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(2001, 1700)).unwrap();
+        let clock = TestClock::at(1700);
+        let (report, code) = run_clocked(
+            &Config::default(),
+            &path,
+            &clock,
+            false,
+            || panic!("an idle tick must not probe"),
+            || panic!("an idle tick must not ping"),
+        )
+        .unwrap();
+        assert!(clock.slept().is_empty());
+        assert_eq!(report.decision, "not_due");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn duration_text_shows_seconds() {
+        assert_eq!(duration_text(17964), "4h 59m 24s");
+        assert_eq!(duration_text(64), "1m 4s");
+        assert_eq!(duration_text(4), "4s");
+        assert_eq!(duration_text(0), "0s");
+    }
+
+    #[test]
+    fn banked_reset_counts_are_diffed_and_persisted() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(20000, 1000)).unwrap();
+        // The first snapshot only stores the counts.
+        assert!(probe_run(&path, 2000, vec![credited("acct-1", 2, 0)]).is_empty());
+        assert_eq!(
+            read_state(&path).unwrap().unwrap().credits.get("acct-1"),
+            Some(&Credits {
+                available: 2,
+                applicable: 0
+            })
+        );
+        // 2 -> 1 spends one credit; 0 -> 1 makes one applicable.
+        assert_eq!(
+            probe_run(&path, 4000, vec![credited("acct-1", 1, 1)]),
+            vec![
+                ResetChange {
+                    kind: "banked_reset_used",
+                    account: "acct-1".into(),
+                    from: 2,
+                    to: 1
+                },
+                ResetChange {
+                    kind: "banked_reset_applicable",
+                    account: "acct-1".into(),
+                    from: 0,
+                    to: 1
+                }
+            ]
+        );
+        // Unchanged counts stay quiet.
+        assert!(probe_run(&path, 6000, vec![credited("acct-1", 1, 1)]).is_empty());
+        // A credit earned is reported too.
+        assert_eq!(
+            probe_run(&path, 8000, vec![credited("acct-1", 2, 1)]),
+            vec![ResetChange {
+                kind: "banked_reset_earned",
+                account: "acct-1".into(),
+                from: 1,
+                to: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn unexpected_reset_movements_are_journaled() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        // A fresh 5h window reopened 1000s later: staff/OpenAI reset.
+        write_state(&path, &plan(20000, 1000)).unwrap();
+        assert_eq!(
+            probe_run(
+                &path,
+                3000,
+                vec![codex_account(vec![window("5h", 21000, 0.0)], None)]
+            ),
+            vec![ResetChange {
+                kind: "window_reopened_early",
+                account: "codex.json".into(),
+                from: 20000,
+                to: 21000
+            }]
+        );
+        // Once a ping re-anchored the window, the same snapshot is quiet.
+        write_state(&path, &plan(21000, 1000)).unwrap();
+        assert!(
+            probe_run(
+                &path,
+                5000,
+                vec![codex_account(vec![window("5h", 21000, 0.0)], None)]
+            )
+            .is_empty()
+        );
+        // A provider reset ahead of the stored one shortens the window.
+        write_state(&path, &plan(20000, 1000)).unwrap();
+        assert_eq!(
+            probe_run(
+                &path,
+                3000,
+                vec![codex_account(vec![window("5h", 19000, 40.0)], None)]
+            ),
+            vec![ResetChange {
+                kind: "window_shortened",
+                account: "codex.json".into(),
+                from: 20000,
+                to: 19000
+            }]
+        );
+        // The weekly class has its own earlier reopening.
+        write_state(
+            &path,
+            &State {
+                long_window_reset_epoch: 20000,
+                ..plan(15000, 1000)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            probe_run(
+                &path,
+                3000,
+                vec![codex_account(vec![window("7d", 40000, 0.0)], None)]
+            ),
+            vec![ResetChange {
+                kind: "long_window_reopened_early",
+                account: "codex.json".into(),
+                from: 20000,
+                to: 40000
+            }]
+        );
+    }
+
+    #[test]
+    fn journal_key_falls_back_to_the_auth_file() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(20000, 1000)).unwrap();
+        let changes = probe_run(
+            &path,
+            3000,
+            vec![codex_account(vec![window("5h", 21000, 0.0)], None)],
+        );
+        assert_eq!(changes[0].account, "codex.json");
+    }
+
+    #[test]
+    fn tick_record_carries_the_run_facts() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(20000, 1000)).unwrap();
+        let (report, code) = run_with(
+            &Config::default(),
+            &path,
+            2000,
+            false,
+            || Ok(vec![credited("acct-1", 2, 0)]),
+            || panic!("must not ping"),
+        )
+        .unwrap();
+        let tick = tick_record(&report, code);
+        assert_eq!(tick["event"], "tick");
+        assert_eq!(tick["decision"], "not_due");
+        // The trigger mirrors the ambient environment: never assert "manual".
+        assert_eq!(tick["trigger"], journal::trigger());
+        assert!(["systemd", "manual"].contains(&tick["trigger"].as_str().unwrap()));
+        assert_eq!(tick["probe_due"], true);
+        assert_eq!(tick["exit"], 0);
+        assert_eq!(tick["due_in_s"], 18000);
+        assert!(tick.get("wait_s").is_none());
+        assert!(tick["ts"].as_str().unwrap().contains('T'));
+        assert!(tick["ts_epoch"].is_number());
+        assert_eq!(tick["stored_5h"], 20000);
+        assert_eq!(tick["provider_5h"], 20000);
+        assert_eq!(tick["early_reset"], false);
+        let account = &tick["accounts"][0];
+        for field in [
+            "file",
+            "email",
+            "plan",
+            "allowed",
+            "limit_reached",
+            "error",
+            "windows",
+            "credits",
+        ] {
+            assert!(account.get(field).is_some(), "account lost {field}");
+        }
+        assert_eq!(account["credits"]["available"], 2);
+        assert_eq!(account["credits"]["applicable"], 0);
+        assert_eq!(account["windows"][0]["label"], "5h");
+        assert_eq!(account["windows"][0]["used_percent"], 40.0);
+        assert!(account["windows"][0].get("reset_at").is_some());
+        assert!(account["windows"][0].get("reset_after").is_some());
+        // A plan without banked credits reports null, not an empty object.
+        let plain = account_record(&codex_account(vec![window("5h", 20000, 40.0)], None));
+        assert_eq!(plain["credits"], Value::Null);
+        assert_eq!(plain["email"], Value::Null);
+        let change = ResetChange {
+            kind: "banked_reset_used",
+            account: "acct-1".into(),
+            from: 2,
+            to: 1,
+        };
+        let record = reset_change_record(2000, &change);
+        assert_eq!(record["event"], "reset_change");
+        assert_eq!(record["kind"], "banked_reset_used");
+        assert_eq!(record["account"], "acct-1");
+        assert_eq!(record["from"], 2);
+        assert_eq!(record["to"], 1);
+    }
+
+    #[test]
+    fn json_report_stays_backward_compatible() {
+        let sandbox = Sandbox::default();
+        let path = sandbox.0.join("auto.json");
+        write_state(&path, &plan(20000, 1000)).unwrap();
+        let (report, _) = run_with(
+            &Config::default(),
+            &path,
+            2000,
+            false,
+            || Ok(vec![credited("acct-1", 2, 0)]),
+            || panic!("must not ping"),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        for field in ["wait_s", "accounts", "reset_changes", "now"] {
+            assert!(value.get(field).is_none(), "json leaked {field}");
+        }
+        assert_eq!(value["decision"], "not_due");
+        assert_eq!(value["probe_due"], true);
     }
 }

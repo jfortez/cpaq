@@ -4,6 +4,17 @@ pub fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
+/// Local RFC3339 timestamp with a numeric offset.
+pub fn rfc3339(epoch: u64) -> String {
+    let Ok(epoch) = i64::try_from(epoch) else {
+        return "?".into();
+    };
+    let mut text = local(epoch, "%Y-%m-%dT%H:%M:%S%z");
+    if text.len() >= 5 {
+        text.insert(text.len() - 2, ':');
+    }
+    text
+}
 pub fn local(epoch: i64, format: &str) -> String {
     let Ok(format) = std::ffi::CString::new(format) else {
         return "?".into();

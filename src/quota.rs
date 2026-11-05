@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::Auth;
@@ -19,6 +19,17 @@ pub const MAX_FETCH_THREADS: usize = 4;
 
 pub(crate) const NO_AUTH_FILES: &str = "no auth files for this provider";
 
+/// Banked reset credits a provider reports for an account.
+///
+/// Absent on plans that do not expose them, so the snapshot is optional.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Credits {
+    /// Reset credits the account has banked.
+    pub available: u32,
+    /// How many of them the current plan can apply.
+    pub applicable: u32,
+}
+
 /// One auth file's quota result, shared with the headless JSON output and TUI.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Account {
@@ -31,6 +42,8 @@ pub struct Account {
     pub limit_reached: Option<bool>,
     pub windows: Vec<Window>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Credits>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
 }

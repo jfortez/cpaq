@@ -51,6 +51,9 @@ impl Paths {
     pub fn auto_state_file(&self) -> PathBuf {
         self.state_home.join("tokenmaxx/auto.json")
     }
+    pub fn auto_log_file(&self) -> PathBuf {
+        self.state_home.join("tokenmaxx/auto.log")
+    }
     pub fn unit_dir(&self) -> PathBuf {
         self.config_home.join("systemd/user")
     }
@@ -142,6 +145,7 @@ mod tests {
             p.config_home.join("cli-proxy-api/auths")
         );
         assert_eq!(p.log_file(), s.0.join("state/tokenmaxx/ping.log"));
+        assert_eq!(p.auto_log_file(), s.0.join("state/tokenmaxx/auto.log"));
         assert_eq!(p.unit_dir(), s.0.join("config/systemd/user"));
     }
 }

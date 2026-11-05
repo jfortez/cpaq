@@ -27,6 +27,7 @@ impl Fixture {
             .env("HOME", self.0.join("home"))
             .env("XDG_CONFIG_HOME", self.0.join("config"))
             .env("XDG_STATE_HOME", self.0.join("state"))
+            .env_remove("INVOCATION_ID")
             .env_remove("CPA_AUTH_DIR")
             .env_remove("CPA_DOCKER_CONTAINER")
             .env_remove("CPA_CONTAINER_AUTH_DIR")
@@ -368,9 +369,13 @@ fn public_auto_probe_error_advances_only_probe_timestamp_and_dry_run_never_write
 fn auto_disabled_reasons_exit_zero_without_writing_state() {
     let f = Fixture::new();
     fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
-    for (config, reason) in [
-        ("enabled=false", "auto: tokenmaxx is disabled\n"),
-        ("auto=false", "auto: auto mode is disabled\n"),
+    for (config, reason, decision) in [
+        ("enabled=false", "auto: tokenmaxx is disabled\n", "disabled"),
+        (
+            "auto=false",
+            "auto: auto mode is disabled\n",
+            "auto_disabled",
+        ),
     ] {
         fs::write(
             f.0.join("config/cpaq/config.toml"),
@@ -381,7 +386,15 @@ fn auto_disabled_reasons_exit_zero_without_writing_state() {
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(out.stdout, reason.as_bytes());
         assert!(out.stderr.is_empty());
-        assert!(!f.0.join("state").exists());
+        // The schedule stays untouched, while the run itself is still journaled.
+        assert!(!f.0.join("state/tokenmaxx/auto.json").exists());
+        let journal = fs::read_to_string(f.0.join("state/tokenmaxx/auto.log")).unwrap();
+        let tick: serde_json::Value =
+            serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        assert_eq!(tick["event"], "tick");
+        assert_eq!(tick["decision"], decision);
+        assert_eq!(tick["exit"], 0);
+        assert_eq!(tick["probe_due"], false);
     }
 }
 
@@ -423,12 +436,14 @@ fn public_units_apply_uses_fake_systemctl_and_writes_auto_units() {
     let service = fs::read_to_string(f.0.join("config/systemd/user/tokenmaxx.service")).unwrap();
     assert!(service.contains(&format!("ExecStart={} auto\n", env!("CARGO_BIN_EXE_cpaq"))));
     assert!(service.contains("ExecStopPost=/usr/bin/systemctl --user try-restart tokenmaxx.timer"));
+    // The exact-second wait and its ping must fit the start timeout.
+    assert!(service.contains("TimeoutStartSec=600\n"));
     let timer = fs::read_to_string(f.0.join("config/systemd/user/tokenmaxx.timer")).unwrap();
     for directive in [
         "OnBootSec=90s",
         "OnCalendar=*:0/5",
         "Persistent=true",
-        "AccuracySec=30s",
+        "AccuracySec=1s",
     ] {
         assert!(timer.contains(directive));
     }
@@ -526,6 +541,51 @@ fn public_auto_due_json_pings_once_logs_and_then_stays_idle() {
     let log = fs::read(f.0.join("state/tokenmaxx/ping.log")).unwrap();
     assert!(String::from_utf8_lossy(&log).contains("ping 1/1"));
     assert!(String::from_utf8_lossy(&log).contains("quota snapshot unavailable"));
+    // Exactly one ping record (origin auto) and one tick record, JSONL, 0600.
+    use std::os::unix::fs::PermissionsExt;
+    let journal_path = f.0.join("state/tokenmaxx/auto.log");
+    assert_eq!(
+        fs::metadata(&journal_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let journal = fs::read_to_string(&journal_path).unwrap();
+    let records: Vec<serde_json::Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "{journal}");
+    let ping = records
+        .iter()
+        .find(|record| record["event"] == "ping")
+        .unwrap();
+    assert_eq!(ping["origin"], "auto");
+    assert_eq!(ping["trigger"], "manual");
+    assert_eq!(ping["result"], "ok");
+    assert_eq!(ping["exit"], 0);
+    assert!(
+        ping["model"]
+            .as_str()
+            .is_some_and(|model| !model.is_empty())
+    );
+    for field in [
+        "last_ping_epoch",
+        "next_due_epoch",
+        "window_reset_epoch",
+        "long_window_reset_epoch",
+    ] {
+        assert!(ping[field].is_u64(), "ping lost {field}");
+    }
+    let tick = records
+        .iter()
+        .find(|record| record["event"] == "tick")
+        .unwrap();
+    assert_eq!(tick["decision"], "due");
+    assert_eq!(tick["trigger"], "manual");
+    assert_eq!(tick["exit"], 0);
+    assert!(tick["due_in_s"].is_i64());
+    assert!(tick.get("wait_s").is_none());
+    assert!(tick["ts_epoch"].is_u64());
+    assert!(cpaq::time::parse_iso(tick["ts"].as_str().unwrap()).is_some());
     for args in [vec!["auto"], vec!["auto", "--dry-run"]] {
         let idle = f.run(&args);
         assert_eq!(idle.status.code(), Some(0));
@@ -614,4 +674,220 @@ fn public_auto_caps_multi_account_pass_and_never_retries_failed_request() {
         assert!(log.contains("ping 1/1"));
         assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
+}
+
+fn idle_state(f: &Fixture, seconds_ahead: i64) -> i64 {
+    fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
+    fs::write(f.0.join("config/cpaq/config.toml"), "[tokenmaxx]\n").unwrap();
+    let state_path = f.0.join("state/tokenmaxx/auto.json");
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let now = cpaq::time::now();
+    let next_due = now + seconds_ahead;
+    fs::write(
+        &state_path,
+        format!(
+            r#"{{"last_ping_epoch":0,"next_due_epoch":{next_due},"last_probe_epoch":{now},"window_reset_epoch":{next_due}}}"#
+        ),
+    )
+    .unwrap();
+    next_due
+}
+
+fn journal_records(f: &Fixture) -> Vec<serde_json::Value> {
+    fs::read_to_string(f.0.join("state/tokenmaxx/auto.log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn public_auto_idle_tick_has_no_wait_and_records_seconds() {
+    // Beyond the 300s precision wait: the run must decide and return at once.
+    let f = Fixture::new();
+    let next_due = idle_state(&f, 3600 + 24);
+    let started = std::time::Instant::now();
+    let out = f.run(&["auto"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text.lines().next().unwrap();
+    let records = journal_records(&f);
+    assert_eq!(records.len(), 1, "{text}");
+    let tick = &records[0];
+    assert_eq!(tick["event"], "tick");
+    assert_eq!(tick["decision"], "not_due");
+    assert_eq!(tick["probe_due"], false);
+    assert_eq!(tick["exit"], 0);
+    assert!(tick.get("wait_s").is_none());
+    let remaining = (next_due - tick["ts_epoch"].as_i64().unwrap()) as u64;
+    assert_eq!(tick["due_in_s"].as_i64().unwrap(), remaining as i64);
+    let expected = format!(
+        "(in {}h {}m {}s; not due)",
+        remaining / 3600,
+        remaining % 3600 / 60,
+        remaining % 60
+    );
+    assert!(line.contains(&expected), "{line} lacks {expected}");
+    assert!(line.starts_with("auto: next due "));
+}
+
+#[test]
+fn public_ping_journals_origin_ping() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (mut request, mut chunk) = (Vec::new(), [0; 4096]);
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(split) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..split]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= split + 4 + length {
+                    break;
+                }
+            }
+        }
+        let body = r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
+    fs::write(
+        f.0.join("config/cpaq/config.toml"),
+        format!("[proxy]\nbase_url='http://{address}'\napi_key='fixture'\ntimeout_secs=1\n"),
+    )
+    .unwrap();
+    let out = f.run(&["ping", "--pings", "1", "--no-quota"]);
+    server.join().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let records = journal_records(&f);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let ping = &records[0];
+    assert_eq!(ping["event"], "ping");
+    assert_eq!(ping["origin"], "ping");
+    assert_eq!(ping["trigger"], "manual");
+    assert_eq!(ping["result"], "ok");
+    assert_eq!(ping["exit"], 0);
+    assert!(ping["next_due_epoch"].is_u64());
+    assert!(records.iter().all(|record| record["event"] != "tick"));
+}
+
+#[test]
+fn public_auto_journal_failure_is_a_single_warning() {
+    let f = Fixture::new();
+    idle_state(&f, 3600);
+    // An unusable journal path must not change the decision or the exit code.
+    fs::create_dir_all(f.0.join("state/tokenmaxx/auto.log")).unwrap();
+    let out = f.run(&["auto"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("; not due)"));
+    assert_eq!(
+        out.stderr,
+        b"warning: cannot write the auto journal\n".to_vec()
+    );
+}
+
+#[test]
+fn public_auto_error_still_journals_one_tick() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
+    // No proxy credentials and no schedule: the run is due and fails at the ping.
+    fs::write(f.0.join("config/cpaq/config.toml"), "[tokenmaxx]\n").unwrap();
+    let out = f.run(&["auto"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.to_lowercase().contains("no api key"), "{stderr}");
+    let records = journal_records(&f);
+    let tick = records
+        .iter()
+        .find(|record| record["event"] == "tick")
+        .unwrap_or_else(|| panic!("no tick recorded: {records:?}"));
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(tick["decision"], "error");
+    assert_eq!(tick["exit"], 1);
+    assert_eq!(tick["trigger"], "manual");
+    assert!(
+        tick["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("no api key")
+    );
+    // No schedule was readable, so there is no due distance to report.
+    assert!(tick.get("due_in_s").is_none());
+    let ping = records
+        .iter()
+        .find(|record| record["event"] == "ping")
+        .unwrap();
+    assert_eq!(ping["origin"], "auto");
+    assert_eq!(ping["result"], "error");
+    assert_eq!(ping["exit"], 1);
+}
+
+#[test]
+fn public_auto_dry_run_error_writes_no_journal() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
+    fs::write(f.0.join("config/cpaq/config.toml"), "[tokenmaxx]\n").unwrap();
+    // A directory where the state file should be makes the read fail.
+    fs::create_dir_all(f.0.join("state/tokenmaxx/auto.json")).unwrap();
+    let out = f.run(&["auto", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cannot read auto state"));
+    assert!(!f.0.join("state/tokenmaxx/auto.log").exists());
+}
+
+#[test]
+fn public_ping_error_still_journals_one_record() {
+    let f = Fixture::new();
+    // No config and no auth dir: the pass cannot resolve proxy credentials.
+    let out = f.run(&["ping", "--pings", "1", "--no-quota"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.to_lowercase().contains("no api key"), "{stderr}");
+    let records = journal_records(&f);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let ping = &records[0];
+    assert_eq!(ping["event"], "ping");
+    assert_eq!(ping["origin"], "ping");
+    assert_eq!(ping["trigger"], "manual");
+    assert_eq!(ping["result"], "error");
+    assert_eq!(ping["exit"], 1);
+    assert!(
+        ping["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("no api key")
+    );
+    assert!(
+        ping["model"]
+            .as_str()
+            .is_some_and(|model| !model.is_empty())
+    );
 }

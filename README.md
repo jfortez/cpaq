@@ -92,6 +92,28 @@ writing. Auto sends at most one ping request, without transport retries.
 with short backoff, keeps a whole run inside a two-minute budget, and
 retries the quota snapshot once; HTTP 4xx/5xx responses are not retried.
 
+## Exact scheduling and the auto journal
+
+The five-minute timer only wakes `cpaq auto`; the exact instant is decided
+inside the run. When the stored due time is at most five minutes away, the run
+sleeps at sub-second precision up to that second, re-reads the state and the
+clock, and pings there, so a reset at `17:35:24` is not lost to a tick at
+`17:40:24`. A manual ping during that wait wins: the re-read state is no longer
+due and the waiting run exits without a second ping. The generated timer uses
+`AccuracySec=1s` and the service allows 600 seconds, enough for the wait plus
+one ping.
+
+Every non-dry-run run appends one JSONL `tick` record to
+`$XDG_STATE_HOME/tokenmaxx/auto.log` (mode 0600, rotated to `auto.log.1` past
+2 MiB), and every ping appends a `ping` record with `origin` `ping` or `auto`.
+When a probe runs, the tick also carries the stored and provider anchors and the
+per-account snapshot; unexpected provider movements (`window_reopened_early`,
+`long_window_reopened_early`, `window_shortened`) and banked-reset changes
+(`banked_reset_used`, `banked_reset_earned`, `banked_reset_applicable`) are
+written as separate `reset_change` records. A journal write failure prints one
+warning and never changes the exit code or blocks a ping. The journal holds no
+credentials, and `cpaq auto --json` keeps its existing shape.
+
 ## Providers
 
 - Codex quotas are supported.
