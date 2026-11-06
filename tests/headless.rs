@@ -51,18 +51,43 @@ fn public_help_and_version_are_successful_without_config() {
     assert!(help.status.success());
     assert!(help.stderr.is_empty());
     let text = String::from_utf8(help.stdout).unwrap();
-    for option in [
-        "--auth-dir",
-        "--json",
-        "--raw",
-        "--provider",
-        "--no-quota",
-        "--pings",
-        "--log",
-        "--model",
-    ] {
-        assert!(text.contains(option));
+    for subcommand in ["quota", "ping", "auto", "log", "report", "units"] {
+        assert!(
+            text.contains(subcommand),
+            "top-level help lost {subcommand}"
+        );
     }
+    for option in ["--auth-dir", "--json", "--raw", "--provider"] {
+        assert!(text.contains(option), "top-level help lost {option}");
+    }
+    for (args, flags) in [
+        (
+            vec!["quota", "--help"],
+            vec!["--json", "--raw", "--provider", "--auth-dir"],
+        ),
+        (
+            vec!["ping", "--help"],
+            vec!["--model", "--pings", "--log", "--no-quota"],
+        ),
+        (vec!["auto", "--help"], vec!["--json", "--dry-run"]),
+        (
+            vec!["log", "--help"],
+            vec!["--follow", "--all", "--limit", "--json"],
+        ),
+        (vec!["report", "--help"], vec!["--days"]),
+    ] {
+        let out = f.run(&args);
+        assert!(out.status.success(), "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        for flag in flags {
+            assert!(text.contains(flag), "{args:?} lost {flag}: {text}");
+        }
+    }
+    // The built-in help subcommand renders a page too.
+    let helped = f.run(&["help", "quota"]);
+    assert!(helped.status.success());
+    assert!(String::from_utf8(helped.stdout).unwrap().contains("--raw"));
     let version = f.run(&["--version"]);
     assert!(version.status.success());
     assert_eq!(
@@ -71,6 +96,7 @@ fn public_help_and_version_are_successful_without_config() {
     );
     assert!(version.stderr.is_empty());
 }
+
 #[test]
 fn missing_or_empty_auth_directory_exits_two_with_actionable_error() {
     let f = Fixture::new();
@@ -133,7 +159,11 @@ fn invalid_options_and_config_never_write_state() {
     let out = f.run(&["ping", "--pings", "0"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
-    assert_eq!(out.stderr, b"--pings must be a positive integer\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--pings must be a positive integer"),
+        "{:?}",
+        out.stderr
+    );
     fs::create_dir_all(f.0.join("config/cpaq")).unwrap();
     fs::write(
         f.0.join("config/cpaq/config.toml"),

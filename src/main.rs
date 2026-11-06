@@ -1,5 +1,5 @@
 use cpaq::{
-    cli::{Args, HELP, Mode},
+    cli::{Args, Mode},
     config::Config,
     paths::Paths,
 };
@@ -10,7 +10,7 @@ use std::{
 
 fn execute(args: Args) -> Result<u8, String> {
     if args.mode == Mode::Help {
-        print!("{HELP}");
+        print!("{}", args.help_text);
         return Ok(0);
     }
     if args.mode == Mode::Version {
