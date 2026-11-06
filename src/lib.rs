@@ -8,6 +8,7 @@ pub mod log;
 pub mod paths;
 pub mod providers;
 pub mod quota;
+pub mod report;
 pub mod systemd;
 pub mod time;
 pub mod tokenmaxx;

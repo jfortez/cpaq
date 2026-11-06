@@ -5,7 +5,7 @@
 
 use std::{
     fs::File,
-    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     os::unix::fs::MetadataExt,
     path::Path,
     time::Duration,
@@ -26,14 +26,14 @@ const PING: &str = "ping";
 
 /// One journaled event, keeping the exact line for `--json` passthrough.
 #[derive(Clone, Debug, PartialEq)]
-struct Record {
-    event: String,
-    line: String,
-    value: Value,
+pub(crate) struct Record {
+    pub(crate) event: String,
+    pub(crate) line: String,
+    pub(crate) value: Value,
 }
 
 impl Record {
-    fn parse(line: &str) -> Option<Self> {
+    pub(crate) fn parse(line: &str) -> Option<Self> {
         let line = line.trim_end_matches('\r');
         let value: Value = serde_json::from_str(line).ok()?;
         let event = value.get("event")?.as_str()?.to_string();
@@ -76,15 +76,21 @@ pub fn run(args: &Args, paths: &Paths) -> Result<i32, String> {
     if !args.all && records.is_empty() {
         note_no_pings(&path, ticks);
     }
-    if print_records(&records, args.json).is_err() {
-        eprintln!("log: cannot write output");
-        return Ok(1);
+    match classify(print_records(
+        &mut std::io::stdout().lock(),
+        &records,
+        args.json,
+    )) {
+        Printed::Failed => {
+            eprintln!("log: cannot write output");
+            Ok(1)
+        }
+        _ => Ok(0),
     }
-    Ok(0)
 }
 
 /// Whole journal, bounded; `Ok(None)` when it does not exist yet.
-fn read_all(path: &Path) -> Result<Option<Vec<u8>>, ()> {
+pub(crate) fn read_all(path: &Path) -> Result<Option<Vec<u8>>, ()> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -110,20 +116,36 @@ fn follow(path: &Path, args: &Args, limit: usize) -> i32 {
     if !args.all && records.is_empty() && !initial.is_empty() {
         note_no_pings(path, ticks);
     }
-    if print_records(&records, args.json).is_err() {
-        eprintln!("log: cannot write output");
-        return 1;
+    if let Some(code) = finish(classify(print_records(
+        &mut std::io::stdout().lock(),
+        &records,
+        args.json,
+    ))) {
+        return code;
     }
     loop {
         std::thread::sleep(POLL);
         match read_new(path, &mut tail) {
             Ok(lines) if lines.is_empty() => {}
             Ok(lines) => {
-                if emit(lines.iter().map(String::as_str), args, usize::MAX) != 0 {
-                    return 1;
+                let printed = emit(lines.iter().map(String::as_str), args, usize::MAX);
+                if let Some(code) = finish(printed) {
+                    return code;
                 }
             }
             Err(()) => return read_failed(path),
+        }
+    }
+}
+
+/// Follow status: keep following, or stop with this code.
+fn finish(printed: Printed) -> Option<i32> {
+    match printed {
+        Printed::Ok => None,
+        Printed::ClosedPipe => Some(0),
+        Printed::Failed => {
+            eprintln!("log: cannot write output");
+            Some(1)
         }
     }
 }
@@ -133,14 +155,14 @@ fn read_failed(path: &Path) -> i32 {
     1
 }
 
-/// Filters, formats and prints one poll; returns 1 only when nothing was written.
-fn emit<'a>(lines: impl Iterator<Item = &'a str>, args: &Args, limit: usize) -> i32 {
+/// Filters, formats and prints one poll.
+fn emit<'a>(lines: impl Iterator<Item = &'a str>, args: &Args, limit: usize) -> Printed {
     let records = collect(lines, args, limit);
-    if print_records(&records, args.json).is_err() {
-        eprintln!("log: cannot write output");
-        return 1;
-    }
-    0
+    classify(print_records(
+        &mut std::io::stdout().lock(),
+        &records,
+        args.json,
+    ))
 }
 
 /// Oldest to newest: filter by event, then keep the last `limit` (0 = all).
@@ -176,17 +198,36 @@ fn note_no_pings(path: &Path, ticks: usize) {
     );
 }
 
-fn print_records(records: &[Record], json: bool) -> std::io::Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+/// Writes records through a buffered writer; the caller classifies the outcome.
+fn print_records(out: &mut impl Write, records: &[Record], json: bool) -> std::io::Result<()> {
+    let mut writer = BufWriter::new(out);
     for record in records {
         if json {
-            writeln!(out, "{}", record.line)?;
+            writeln!(writer, "{}", record.line)?;
         } else {
-            writeln!(out, "{}", human(record))?;
+            writeln!(writer, "{}", human(record))?;
         }
     }
-    out.flush()
+    writer.flush()
+}
+
+/// What one stdout write meant for the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Printed {
+    Ok,
+    /// The reader closed the pipe (`| head`): a normal end of output.
+    ClosedPipe,
+    /// A real write failure; the caller reports it and exits 1.
+    Failed,
+}
+
+/// Only a broken pipe is silently fine; every other error must be reported.
+pub(crate) fn classify(result: std::io::Result<()>) -> Printed {
+    match result {
+        Ok(()) => Printed::Ok,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Printed::ClosedPipe,
+        Err(_) => Printed::Failed,
+    }
 }
 
 /// One stable line per record; the journal's own `ts` is the timestamp.
@@ -475,6 +516,51 @@ mod tests {
         assert!(read_new(&path, &mut tail).unwrap().is_empty());
         fs::write(&path, format!("{TICK}\n")).unwrap();
         assert_eq!(read_new(&path, &mut tail).unwrap(), vec![TICK.to_string()]);
+    }
+
+    /// Writer that fails like a consumer closing the pipe early.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// Writer that fails for any other reason: that must stay visible.
+    struct BrokenDisk;
+
+    impl Write for BrokenDisk {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::StorageFull.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(ErrorKind::StorageFull.into())
+        }
+    }
+
+    #[test]
+    fn closed_pipe_is_success_and_other_write_failures_are_not() {
+        let records = collect(PING_OK.lines(), &args(false, false, Some(20)), 20);
+        for json in [false, true] {
+            assert_eq!(
+                classify(print_records(&mut ClosedPipe, &records, json)),
+                Printed::ClosedPipe
+            );
+        }
+        assert_eq!(
+            classify(print_records(&mut BrokenDisk, &records, false)),
+            Printed::Failed
+        );
+        // A working writer still gets the records.
+        let mut buffer = Vec::new();
+        print_records(&mut buffer, &records, true).unwrap();
+        assert_eq!(String::from_utf8(buffer).unwrap(), format!("{PING_OK}\n"));
     }
 
     #[test]

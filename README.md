@@ -26,6 +26,7 @@ cpaq ping           # unconditional keep-alive pass
 cpaq auto           # local due check and bounded early-reset probe (systemd timer)
 cpaq auto --dry-run # decision and would-be state; quota reads only, no ping/writes
 cpaq log            # journal tail: the last 20 ping records
+cpaq report         # visual report: daily summary plus ping and reset details
 cpaq units apply    # save config and regenerate/enable the user units
 ```
 
@@ -121,6 +122,12 @@ newest, with `--all` widening the selection to ticks and reset changes and
 through, and `--follow`/`-f` prints that tail once and then polls every 500 ms,
 reopening from zero after a truncation or a rotation, so a running tail survives
 `auto.log` becoming `auto.log.1`.
+
+`cpaq report --days N` turns the journal into a readable report (`0` = all
+records, default seven local calendar days): a per-day table with ticks,
+probes, pings, ok/err, auto/manual, average and maximum wait and reset counts,
+then the next due instant, the pings with the wait of the tick that sent them,
+and the unexpected reset changes from the probe.
 
 ## Providers
 

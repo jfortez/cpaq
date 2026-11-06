@@ -993,6 +993,113 @@ fn public_log_without_pings_says_so_and_keeps_stdout_clean() {
     assert!(text.lines().all(|line| line.contains("  tick  ")));
 }
 
+const REPORT_TICK: &str = r#"{"decision":"due","due_in_s":-3,"event":"tick","exit":0,"probe_due":true,"ts":"2026-11-05T20:00:00-05:00","ts_epoch":1793930000,"wait_s":26}"#;
+const REPORT_TICK_IDLE: &str = r#"{"decision":"not_due","due_in_s":1000,"event":"tick","exit":0,"probe_due":false,"ts":"2026-11-05T20:10:00-05:00","ts_epoch":1793930600}"#;
+const REPORT_PING: &str = r#"{"event":"ping","exit":0,"finished_epoch":1793930028,"model":"gpt-6-luna","next_due_epoch":1793948000,"origin":"ping","result":"ok","ts":"2026-11-05T20:00:00-05:00","ts_epoch":1793930000}"#;
+const REPORT_RESET: &str = r#"{"account":"acct-1","event":"reset_change","from":2,"kind":"banked_reset_used","to":1,"ts":"2026-11-05T20:12:00-05:00","ts_epoch":1793930720}"#;
+
+#[test]
+fn public_report_renders_summary_details_and_next_due() {
+    let f = Fixture::new();
+    journal_fixture(
+        &f,
+        &[REPORT_TICK, REPORT_PING, REPORT_TICK_IDLE, REPORT_RESET],
+    );
+    fs::write(
+        f.0.join("state/tokenmaxx/auto.json"),
+        br#"{"last_ping_epoch":1793930000,"next_due_epoch":1793948000,"last_probe_epoch":1793930000,"window_reset_epoch":1793948000}"#,
+    )
+    .unwrap();
+
+    let out = f.run(&["report", "--days", "0"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.starts_with("cpaq tokenmaxx report - all records, through 20"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Date        Ticks  Probes  Pings  OK  Err  Auto  Manual"),
+        "{text}"
+    );
+    // Two ticks (one probe), one ok manual ping and one reset change.
+    let row = text
+        .lines()
+        .find(|line| line.contains("  2      1       1      1   0    0     1       "))
+        .unwrap_or_else(|| panic!("no summary row: {text}"));
+    assert!(
+        row.starts_with(&cpaq::time::local(1793930000, "%Y-%m-%d")),
+        "{row}"
+    );
+    assert!(row.ends_with("0:26      0:26      1"), "{row}");
+    assert!(
+        text.contains(&format!(
+            "Next due: {} ",
+            cpaq::time::local_datetime(1793948000)
+        )),
+        "{text}"
+    );
+    assert!(text.contains("(in "), "{text}");
+    // Details: the manual ping picks up the wait of the tick that pinged.
+    assert!(text.contains("Pings"), "{text}");
+    let ping = text
+        .lines()
+        .find(|line| line.contains("  manual  ok      gpt-6-luna"))
+        .unwrap_or_else(|| panic!("no ping row: {text}"));
+    assert!(ping.contains("0:26"), "{ping}");
+    assert!(
+        ping.starts_with(&format!(
+            "  {}  manual  ok",
+            cpaq::time::local_datetime(1793930000)
+        )),
+        "{ping}"
+    );
+    assert!(
+        ping.contains(&cpaq::time::local_datetime(1793948000)),
+        "{ping}"
+    );
+    // Detail columns are padded, so assert the cells rather than the gaps.
+    let reset = text
+        .lines()
+        .find(|line| line.contains("banked_reset_used"))
+        .unwrap_or_else(|| panic!("no reset row: {text}"));
+    assert!(reset.starts_with("  "), "{reset}");
+    assert!(reset.contains("acct-1"), "{reset}");
+    assert!(reset.ends_with("2 -> 1"), "{reset}");
+    assert!(
+        text.lines().all(|line| line == line.trim_end()),
+        "trailing space"
+    );
+    // --days 1 drops records dated before today.
+    let recent = f.run(&["report", "--days", "1"]);
+    assert_eq!(recent.status.code(), Some(0));
+    let recent = String::from_utf8(recent.stdout).unwrap();
+    assert!(recent.contains("last 1 day(s)"), "{recent}");
+}
+
+#[test]
+fn public_report_missing_journal_is_a_friendly_exit_zero() {
+    let f = Fixture::new();
+    let out = f.run(&["report"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    let path = f.0.join("state/tokenmaxx/auto.log");
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        format!("report: no journal yet at {}\n", path.display())
+    );
+    // Without a state file the next-due line is omitted but the report renders.
+    let f = Fixture::new();
+    journal_fixture(&f, &[REPORT_TICK_IDLE]);
+    let out = f.run(&["report", "--days", "0"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("Next due:"), "{text}");
+    assert!(text.contains("  (no pings yet)"), "{text}");
+    assert!(text.contains("  (none)"), "{text}");
+}
+
 #[test]
 fn public_log_missing_journal_is_a_friendly_exit_zero() {
     let f = Fixture::new();

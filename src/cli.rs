@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-pub const HELP: &str = "cpaq — CLIProxyAPI quotas and tokenmaxx\n\nUsage:\n  cpaq                         TUI when stdout is a TTY; otherwise quota\n  cpaq quota [--json] [--raw] [--provider P]... [--auth-dir DIR]\n  cpaq --json                  Headless quota JSON\n  cpaq ping [--model M] [--pings N] [--log FILE] [--no-quota]\n  cpaq auto [--json] [--dry-run]    Local due check, bounded quota probe and keep-alive\n  cpaq log [--follow|-f] [--json] [--all] [--limit N]   Tokenmaxx journal tail (last 20 pings)\n  cpaq units apply               Save config and apply systemd units\n  cpaq --help | --version\n\nQuota: -p/--provider is repeatable; positional providers are also accepted.\nAuth discovery: --auth-dir > CPA_AUTH_DIR > config > XDG cli-proxy-api/auths > cpa/auths.\nContainer fallback: CPA_DOCKER_SOCKET (default /var/run/docker.sock), CPA_DOCKER_CONTAINER, CPA_CONTAINER_AUTH_DIR.\nPing: --pings must be positive; default one per account, minimum one.\nAuto: enabled by default; probe_minutes=15 (0 disables) checks early 5h and weekly Codex resets.\nAuto waits for the exact due second when it is at most 300s away, then pings once in that run.\nAuto journal: $XDG_STATE_HOME/tokenmaxx/auto.log, JSONL mode 0600, rotated at 2 MiB; write failures only warn.\nLog: journal tail, oldest to newest; --all adds ticks and reset changes, --limit N (0 = all), --follow polls and reopens after rotation, --json passes raw lines through.\nDry-run may read quota when a probe is due; it never pings, waits or writes state.\nPing/auto share state after any codex snapshot: earliest reopening (5h, or the weekly reset of a spent account), or interval_hours without one.\nPing retries transport failures (DNS/connect/timeout) 3 times; HTTP 4xx/5xx is not retried.\nAuto sends at most one ping request per run, without transport retries.\nTUI: q quit, ? help, r refresh, Tab switch tabs, arrows/j/k navigate, Enter details/edit, Esc close.\nTokenmaxx: space toggle/edit, a toggle auto (saved immediately), s save & apply, x run now.\n";
+pub const HELP: &str = "cpaq — CLIProxyAPI quotas and tokenmaxx\n\nUsage:\n  cpaq                         TUI when stdout is a TTY; otherwise quota\n  cpaq quota [--json] [--raw] [--provider P]... [--auth-dir DIR]\n  cpaq --json                  Headless quota JSON\n  cpaq ping [--model M] [--pings N] [--log FILE] [--no-quota]\n  cpaq auto [--json] [--dry-run]    Local due check, bounded quota probe and keep-alive\n  cpaq log [--follow|-f] [--json] [--all] [--limit N]   Tokenmaxx journal tail (last 20 pings)\n  cpaq report [--days N]   Tokenmaxx visual report (daily summary + ping details)\n  cpaq units apply               Save config and apply systemd units\n  cpaq --help | --version\n\nQuota: -p/--provider is repeatable; positional providers are also accepted.\nAuth discovery: --auth-dir > CPA_AUTH_DIR > config > XDG cli-proxy-api/auths > cpa/auths.\nContainer fallback: CPA_DOCKER_SOCKET (default /var/run/docker.sock), CPA_DOCKER_CONTAINER, CPA_CONTAINER_AUTH_DIR.\nPing: --pings must be positive; default one per account, minimum one.\nAuto: enabled by default; probe_minutes=15 (0 disables) checks early 5h and weekly Codex resets.\nAuto waits for the exact due second when it is at most 300s away, then pings once in that run.\nAuto journal: $XDG_STATE_HOME/tokenmaxx/auto.log, JSONL mode 0600, rotated at 2 MiB; write failures only warn.\nLog: journal tail, oldest to newest; --all adds ticks and reset changes, --limit N (0 = all), --follow polls and reopens after rotation, --json passes raw lines through.\nDry-run may read quota when a probe is due; it never pings, waits or writes state.\nPing/auto share state after any codex snapshot: earliest reopening (5h, or the weekly reset of a spent account), or interval_hours without one.\nPing retries transport failures (DNS/connect/timeout) 3 times; HTTP 4xx/5xx is not retried.\nAuto sends at most one ping request per run, without transport retries.\nTUI: q quit, ? help, r refresh, Tab switch tabs, arrows/j/k navigate, Enter details/edit, Esc close.\nTokenmaxx: space toggle/edit, a toggle auto (saved immediately), s save & apply, x run now.\n";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Mode {
     #[default]
     Default,
     Auto,
     Log,
+    Report,
     UnitsApply,
     Quota,
     Ping,
@@ -28,6 +29,7 @@ pub struct Args {
     pub follow: bool,
     pub all: bool,
     pub limit: Option<usize>,
+    pub days: Option<usize>,
 }
 impl Args {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
@@ -49,6 +51,10 @@ impl Args {
                 }
                 "log" => {
                     out.mode = Mode::Log;
+                    iter.next();
+                }
+                "report" => {
+                    out.mode = Mode::Report;
                     iter.next();
                 }
                 "units" => {
@@ -74,6 +80,13 @@ impl Args {
                 "--follow" | "-f" if out.mode == Mode::Log => out.follow = true,
                 "--all" if out.mode == Mode::Log => out.all = true,
                 "--json" if out.mode == Mode::Log => out.json = true,
+                "--days" if out.mode == Mode::Report => {
+                    out.days = Some(
+                        value()?
+                            .parse::<usize>()
+                            .map_err(|_| "--days must be a non-negative integer")?,
+                    );
+                }
                 "--limit" if out.mode == Mode::Log => {
                     out.limit = Some(
                         value()?
@@ -173,6 +186,20 @@ mod tests {
         assert!(parse(&["auto", "--follow"]).is_err());
         assert!(parse(&["auto", "--all"]).is_err());
         assert!(parse(&["auto", "--limit", "3"]).is_err());
+    }
+
+    #[test]
+    fn report_days_parses_and_rejects_other_options() {
+        let args = parse(&["report", "--days", "0"]).unwrap();
+        assert_eq!(args.mode, Mode::Report);
+        assert_eq!(args.days, Some(0));
+        assert_eq!(parse(&["report"]).unwrap().days, None);
+        assert!(parse(&["report", "--days", "-1"]).is_err());
+        assert!(parse(&["report", "--days"]).is_err());
+        for flag in ["--json", "--all", "--follow", "--limit", "--dry-run"] {
+            assert!(parse(&["report", flag, "x"]).is_err(), "{flag}");
+        }
+        assert!(parse(&["log", "--days", "2"]).is_err());
     }
 
     #[test]
