@@ -252,6 +252,19 @@ fn public_ping_posts_to_fake_proxy_and_tees_safe_logs() {
                 output.stdout
             );
         }
+        let journal = fs::read_to_string(f.0.join("state/tokenmaxx/auto.log")).unwrap();
+        let ping = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["event"] == "ping")
+            .expect("ping record");
+        if statuses == [500, 500] {
+            assert_eq!(ping["result"], "error");
+            assert_eq!(ping["error"], "http 500");
+        } else {
+            assert_eq!(ping["result"], "ok");
+            assert!(ping.get("error").is_none());
+        }
         for request in requests {
             assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
             let (headers, body) = request.split_once("\r\n\r\n").unwrap();
@@ -1005,9 +1018,12 @@ fn public_report_renders_summary_details_and_next_due() {
         &f,
         &[REPORT_TICK, REPORT_PING, REPORT_TICK_IDLE, REPORT_RESET],
     );
+    let soon = cpaq::time::now() as u64 + 3600;
     fs::write(
         f.0.join("state/tokenmaxx/auto.json"),
-        br#"{"last_ping_epoch":1793930000,"next_due_epoch":1793948000,"last_probe_epoch":1793930000,"window_reset_epoch":1793948000}"#,
+        format!(
+            r#"{{"last_ping_epoch":1793930000,"next_due_epoch":{soon},"last_probe_epoch":1793930000,"window_reset_epoch":{soon}}}"#
+        ),
     )
     .unwrap();
 
@@ -1020,13 +1036,13 @@ fn public_report_renders_summary_details_and_next_due() {
         "{text}"
     );
     assert!(
-        text.contains("Date        Ticks  Probes  Pings  OK  Err  Auto  Manual"),
+        text.contains("Date        Ticks  Probes  Pings  OK  Err  Timer  Manual"),
         "{text}"
     );
     // Two ticks (one probe), one ok manual ping and one reset change.
     let row = text
         .lines()
-        .find(|line| line.contains("  2      1       1      1   0    0     1       "))
+        .find(|line| line.contains("  2      1       1      1   0    0      1       "))
         .unwrap_or_else(|| panic!("no summary row: {text}"));
     assert!(
         row.starts_with(&cpaq::time::local(1793930000, "%Y-%m-%d")),
@@ -1034,10 +1050,7 @@ fn public_report_renders_summary_details_and_next_due() {
     );
     assert!(row.ends_with("0:26      0:26      1"), "{row}");
     assert!(
-        text.contains(&format!(
-            "Next due: {} ",
-            cpaq::time::local_datetime(1793948000)
-        )),
+        text.contains(&format!("Next due: {} ", cpaq::time::local_datetime(soon))),
         "{text}"
     );
     assert!(text.contains("(in "), "{text}");

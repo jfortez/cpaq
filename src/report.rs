@@ -76,7 +76,7 @@ struct Day {
     pings: usize,
     ok: usize,
     errors: usize,
-    auto: usize,
+    timer: usize,
     manual: usize,
     resets: usize,
     waits: Vec<i64>,
@@ -129,8 +129,8 @@ fn render(records: &[Record], next_due: Option<u64>, now: i64, days: usize) -> V
                 } else {
                     day.errors += 1;
                 }
-                if string(record, "origin") == "auto" {
-                    day.auto += 1;
+                if string(record, "trigger") == "systemd" {
+                    day.timer += 1;
                 } else {
                     day.manual += 1;
                 }
@@ -156,7 +156,7 @@ fn render(records: &[Record], next_due: Option<u64>, now: i64, days: usize) -> V
                 day.pings.to_string(),
                 day.ok.to_string(),
                 day.errors.to_string(),
-                day.auto.to_string(),
+                day.timer.to_string(),
                 day.manual.to_string(),
                 average,
                 day.waits
@@ -170,7 +170,7 @@ fn render(records: &[Record], next_due: Option<u64>, now: i64, days: usize) -> V
         .collect();
     table.extend(table_lines(
         &[
-            "Date", "Ticks", "Probes", "Pings", "OK", "Err", "Auto", "Manual", "Avg wait",
+            "Date", "Ticks", "Probes", "Pings", "OK", "Err", "Timer", "Manual", "Avg wait",
             "Max wait", "Resets",
         ],
         &rows,
@@ -210,9 +210,9 @@ fn render(records: &[Record], next_due: Option<u64>, now: i64, days: usize) -> V
             let start = epoch_of(ping);
             vec![
                 local_datetime(start as u64),
-                match string(ping, "origin") {
-                    "ping" => "manual".to_string(),
-                    other => other.to_string(),
+                match string(ping, "trigger") {
+                    "systemd" => "timer".to_string(),
+                    _ => "manual".to_string(),
                 },
                 string(ping, "result").to_string(),
                 string(ping, "model").to_string(),
@@ -230,7 +230,7 @@ fn render(records: &[Record], next_due: Option<u64>, now: i64, days: usize) -> V
     table.extend(table_lines(
         &[
             "start",
-            "origin",
+            "via",
             "result",
             "model",
             "wait",
@@ -440,6 +440,7 @@ mod tests {
             "ts": local(epoch, "%Y-%m-%dT%H:%M:%S%z"),
             "ts_epoch": epoch,
             "origin": origin,
+            "trigger": if origin == "auto" { "systemd" } else { "manual" },
             "result": result,
             "model": "gpt-6-luna",
             "next_due_epoch": epoch + 18_000,
@@ -511,23 +512,53 @@ mod tests {
         // The header comes from the spec reference, so alignment is pinned.
         assert_eq!(
             lines[2],
-            "Date        Ticks  Probes  Pings  OK  Err  Auto  Manual  Avg wait  Max wait  Resets"
+            "Date        Ticks  Probes  Pings  OK  Err  Timer  Manual  Avg wait  Max wait  Resets"
         );
         assert_eq!(
             lines[3],
             format!(
-                "{date_yesterday}  4      2       1      1   0    1     0       0:53      1:39      1"
+                "{date_yesterday}  4      2       1      1   0    1      0       0:53      1:39      1"
             )
         );
         assert_eq!(
             lines[4],
             format!(
-                "{date_today}  1      0       2      1   1    0     2       0:26      0:26      0"
+                "{date_today}  1      0       2      1   1    0      2       0:26      0:26      0"
             )
         );
         assert!(
             lines.iter().all(|line| line == line.trim_end()),
             "trailing space"
+        );
+    }
+
+    #[test]
+    fn manual_auto_run_counts_as_manual_not_timer() {
+        let now = 1_793_930_000_i64;
+        let epoch = crate::time::local_midnight_days_ago(now, 0).unwrap() + 3600;
+        let record = record(json!({
+            "event": "ping",
+            "ts": local(epoch, "%Y-%m-%dT%H:%M:%S%z"),
+            "ts_epoch": epoch,
+            "origin": "auto",
+            "trigger": "manual",
+            "result": "ok",
+            "model": "gpt-6-luna",
+            "next_due_epoch": epoch + 18_000,
+            "exit": 0,
+        }));
+        let lines = report(&[record], None, now, 7);
+        let row = lines
+            .iter()
+            .find(|line| line.starts_with(&local(now, "%Y-%m-%d")))
+            .unwrap();
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        // date ticks probes pings ok err timer manual avg max resets
+        assert_eq!(cells[6], "0", "Timer: {row}");
+        assert_eq!(cells[7], "1", "Manual: {row}");
+        assert!(
+            lines.iter().any(|line| line.contains("  manual  ok")),
+            "{lines:#?}"
         );
     }
 
@@ -574,12 +605,12 @@ mod tests {
         assert!(manual[1].contains("  error   gpt-6-luna"), "{}", manual[1]);
         let auto: Vec<&String> = lines
             .iter()
-            .filter(|line| line.contains("  auto    "))
+            .filter(|line| line.contains("  timer   "))
             .collect();
         assert_eq!(auto.len(), 1, "{lines:#?}");
         assert!(
             auto[0].starts_with(&format!(
-                "  {}  auto    ok",
+                "  {}  timer   ok",
                 local_datetime((yesterday + 60) as u64)
             )),
             "{}",
@@ -644,7 +675,7 @@ mod tests {
             .unwrap();
         for (column, start) in [
             ("start", 2),
-            ("origin", 23),
+            ("via", 23),
             ("result", 31),
             ("model", 39),
             ("wait", 53),

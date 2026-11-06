@@ -228,6 +228,12 @@ pub fn run(args: &Args, paths: &Paths, config: &Config) -> Result<i32, String> {
     run_output(args, paths, config, true)
 }
 
+/// Outcome of one keep-alive pass: exit code plus the last attempt failure.
+struct PassOutcome {
+    code: i32,
+    failure: Option<String>,
+}
+
 /// Runs the existing pass, optionally keeping stdout free for auto JSON.
 pub(crate) fn run_output(
     args: &Args,
@@ -239,9 +245,14 @@ pub(crate) fn run_output(
     // record is stamped when the attempt begins, not when the pass returns.
     let started = crate::time::now().max(0) as u64;
     match run_pass(args, paths, config, stdout) {
-        Ok(code) => {
-            journal_ping(args, paths, config, code, None, started);
-            Ok(code)
+        Ok(pass) => {
+            let error = if pass.code == 0 {
+                None
+            } else {
+                pass.failure.as_deref()
+            };
+            journal_ping(args, paths, config, pass.code, error, started);
+            Ok(pass.code)
         }
         Err(error) => {
             journal_ping(args, paths, config, 1, Some(&error), started);
@@ -252,7 +263,12 @@ pub(crate) fn run_output(
 
 /// Runs one keep-alive pass; the caller journals its outcome and passes the
 /// error through unchanged.
-fn run_pass(args: &Args, paths: &Paths, config: &Config, stdout: bool) -> Result<i32, String> {
+fn run_pass(
+    args: &Args,
+    paths: &Paths,
+    config: &Config,
+    stdout: bool,
+) -> Result<PassOutcome, String> {
     let proxy = config.proxy_credentials(paths)?;
     let path = log_path(args, paths, config);
     let mut file = FileSink::open(&path)?;
@@ -361,7 +377,7 @@ fn run_with(
     proxy: &ProxyConfig,
     seams: &Seams<'_>,
     sink: &mut dyn LogSink,
-) -> Result<i32, String> {
+) -> Result<PassOutcome, String> {
     // A missing auth directory is not fatal: the keep-alive still needs its
     // minimum of one ping.
     let auth_dir = paths.resolve_auth(None, config.auth_dir()).ok();
@@ -393,6 +409,7 @@ fn run_with(
     let deadline = Instant::now() + seams.retry.budget;
 
     let mut succeeded = 0_usize;
+    let mut failure: Option<String> = None;
     for index in 1..=total {
         let stamp = timestamp();
         let request = HttpRequest {
@@ -414,13 +431,19 @@ fn run_with(
                     },
                 )
             }
-            Ok(reply) => format!(
-                "{stamp} ping {index}/{total} model={model_label} status=error http={}",
-                reply.status
-            ),
-            Err(_) => format!(
-                "{stamp} ping {index}/{total} model={model_label} status=error reason=request-failed"
-            ),
+            Ok(reply) => {
+                failure = Some(format!("http {}", reply.status));
+                format!(
+                    "{stamp} ping {index}/{total} model={model_label} status=error http={}",
+                    reply.status
+                )
+            }
+            Err(_) => {
+                failure = Some("request-failed".to_string());
+                format!(
+                    "{stamp} ping {index}/{total} model={model_label} status=error reason=request-failed"
+                )
+            }
         };
         sink.write_line(&line)?;
     }
@@ -440,7 +463,10 @@ fn run_with(
         )?;
     }
 
-    Ok(i32::from(succeeded == 0))
+    Ok(PassOutcome {
+        code: i32::from(succeeded == 0),
+        failure,
+    })
 }
 
 fn count_accounts(dir: &Path) -> usize {
@@ -718,7 +744,7 @@ mod tests {
             snapshot,
             retry,
         };
-        run_with(args, paths, config, &proxy, &seams, sink)
+        run_with(args, paths, config, &proxy, &seams, sink).map(|pass| pass.code)
     }
 
     #[test]
