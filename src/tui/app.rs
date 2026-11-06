@@ -142,6 +142,7 @@ pub struct TokenmaxxState {
     pub log_pending: bool,
     pub save_pending: bool,
     pub run_pending: bool,
+    pub ping_pending: bool,
 }
 
 /// Work the UI asks the background workers to perform.
@@ -154,6 +155,7 @@ pub enum Command {
     RefreshLog,
     Apply(Box<Config>),
     RunNow,
+    PingNow,
 }
 
 /// Results delivered from background workers through `mpsc`.
@@ -178,6 +180,7 @@ pub enum WorkerMessage {
         result: Result<(), String>,
     },
     RunNow(Result<(), String>),
+    Ping(Result<i32, String>),
 }
 
 /// Request sent to the single quota worker thread.
@@ -223,6 +226,7 @@ impl App {
             log_pending: false,
             save_pending: false,
             run_pending: false,
+            ping_pending: false,
         };
         Self {
             paths,
@@ -324,6 +328,7 @@ impl App {
             }
             KeyCode::Char('s') if self.tab == Tab::Tokenmaxx => self.request_save(),
             KeyCode::Char('x') if self.tab == Tab::Tokenmaxx => self.request_run_now(),
+            KeyCode::Char('p') if self.tab == Tab::Tokenmaxx => self.request_ping_now(),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection(1);
                 Vec::new()
@@ -424,6 +429,19 @@ impl App {
                         Vec::new()
                     }
                 }
+            }
+            WorkerMessage::Ping(result) => {
+                self.tokenmaxx.ping_pending = false;
+                match result {
+                    Ok(0) => self.set_status("Ping sent", false),
+                    Ok(code) => self.set_status(format!("Ping failed (exit {code})"), true),
+                    Err(error) => {
+                        self.set_status(format!("Ping failed: {}", sanitize(&error)), true)
+                    }
+                }
+                // The pass moved the windows: re-read the schedule, timer, log
+                // and quotas instead of trusting the pre-ping snapshot.
+                self.refresh_after_ping()
             }
         }
     }
@@ -727,6 +745,23 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    fn request_ping_now(&mut self) -> Vec<Command> {
+        if self.tokenmaxx.ping_pending {
+            self.set_status("Ping already in progress", false);
+            return Vec::new();
+        }
+        self.tokenmaxx.ping_pending = true;
+        self.set_status("Pinging now…", false);
+        vec![Command::PingNow]
+    }
+
+    fn refresh_after_ping(&mut self) -> Vec<Command> {
+        let mut commands = vec![Command::RefreshQuota];
+        commands.extend(self.request_timer());
+        commands.extend(self.request_log());
+        commands
     }
 
     fn request_run_now(&mut self) -> Vec<Command> {
@@ -1107,6 +1142,40 @@ mod tests {
         app.tokenmaxx.draft.model = "  ".into();
         assert!(app.handle_key(key(KeyCode::Char('s'))).is_empty());
         assert!(!app.tokenmaxx.save_pending);
+    }
+
+    #[test]
+    fn ping_now_is_single_flight_and_clears_on_completion() {
+        let mut app = App::new(test_paths(), Config::default(), Args::default());
+        app.tab = Tab::Tokenmaxx;
+        let commands = app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::PingNow));
+        assert!(app.tokenmaxx.ping_pending);
+        assert_eq!(app.status, "Pinging now…");
+        // A second `p` while pending is a no-op with an explanation.
+        assert!(app.handle_key(key(KeyCode::Char('p'))).is_empty());
+        assert_eq!(app.status, "Ping already in progress");
+
+        let commands = app.apply_message(WorkerMessage::Ping(Ok(0)));
+        assert!(!app.tokenmaxx.ping_pending);
+        assert_eq!(app.status, "Ping sent");
+        assert!(!app.status_error);
+        assert!(matches!(commands[0], Command::RefreshQuota));
+        assert!(commands.iter().any(|c| matches!(c, Command::RefreshTimer)));
+        assert!(commands.iter().any(|c| matches!(c, Command::RefreshLog)));
+
+        app.tokenmaxx.ping_pending = true;
+        app.apply_message(WorkerMessage::Ping(Ok(3)));
+        assert!(!app.tokenmaxx.ping_pending);
+        assert_eq!(app.status, "Ping failed (exit 3)");
+        assert!(app.status_error);
+
+        app.tokenmaxx.ping_pending = true;
+        app.apply_message(WorkerMessage::Ping(Err("no API key".into())));
+        assert!(!app.tokenmaxx.ping_pending);
+        assert_eq!(app.status, "Ping failed: no API key");
+        assert!(app.status_error);
     }
 
     #[test]

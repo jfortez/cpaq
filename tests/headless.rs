@@ -98,6 +98,43 @@ fn public_help_and_version_are_successful_without_config() {
 }
 
 #[test]
+fn public_bare_cpaq_shows_help_without_config_or_auth() {
+    let f = Fixture::new();
+    let out = f.run(&[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Usage: cpaq"), "{text}");
+    for command in ["quota", "ping", "auto", "log", "report", "units", "tui"] {
+        assert!(text.contains(command), "bare help lost {command}");
+    }
+    // No state, config or auth directory was touched.
+    assert!(!f.0.join("state").exists());
+    assert!(!f.0.join("config/cpaq/config.toml").exists());
+}
+
+#[test]
+fn public_tui_requires_a_terminal() {
+    let f = Fixture::new();
+    let out = f.run(&["tui"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        out.stderr,
+        b"cpaq tui requires a terminal; see cpaq --help\n".to_vec()
+    );
+    // The TUI help page is still reachable without a terminal.
+    let help = f.run(&["tui", "--help"]);
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("interactive")
+    );
+}
+
+#[test]
 fn missing_or_empty_auth_directory_exits_two_with_actionable_error() {
     let f = Fixture::new();
     let absent = f.run(&["quota", "--json"]);

@@ -21,7 +21,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    cli::Args,
+    cli::{Args, Mode},
     config::Config,
     paths::Paths,
     quota,
@@ -186,6 +186,12 @@ fn dispatch(
         Command::RunNow => {
             let _ = system_jobs.send(SystemJob::RunNow);
         }
+        Command::PingNow => {
+            let _ = system_jobs.send(SystemJob::Ping {
+                config: app.base_config.clone(),
+                paths: app.paths.clone(),
+            });
+        }
     }
 }
 
@@ -194,6 +200,7 @@ enum SystemJob {
     Log { path: PathBuf },
     Apply { config: Box<Config>, paths: Paths },
     RunNow,
+    Ping { config: Config, paths: Paths },
 }
 
 fn spawn_quota_worker(
@@ -272,6 +279,17 @@ fn spawn_system_worker(
                         WorkerMessage::Applied { config, result }
                     }
                     SystemJob::RunNow => WorkerMessage::RunNow(systemd::run_now(&runner)),
+                    SystemJob::Ping { config, paths } => {
+                        // One manual keep-alive pass with the saved config; the
+                        // pass writes only to the configured ping log.
+                        let args = Args {
+                            mode: Mode::Ping,
+                            ..Args::default()
+                        };
+                        WorkerMessage::Ping(crate::tokenmaxx::run_output(
+                            &args, &paths, &config, false,
+                        ))
+                    }
                 };
                 if messages.send(message).is_err() {
                     break;

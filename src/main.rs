@@ -17,6 +17,17 @@ fn execute(args: Args) -> Result<u8, String> {
         println!("cpaq {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
+    if args.mode == Mode::Tui {
+        // No config or terminal setup happens when there is no terminal.
+        if !io::stdout().is_terminal() {
+            eprintln!("cpaq tui requires a terminal; see cpaq --help");
+            return Ok(2);
+        }
+        let paths = Paths::from_env()?;
+        let config = Config::load(&paths.config_file())?;
+        cpaq::tui::run(paths, config, args)?;
+        return Ok(0);
+    }
     let paths = Paths::from_env()?;
     let config = Config::load(&paths.config_file())?;
     if args.mode == Mode::Ping {
@@ -36,10 +47,6 @@ fn execute(args: Args) -> Result<u8, String> {
             .map_err(|_| "Cannot determine cpaq executable path".to_string())?;
         cpaq::systemd::apply(&config, &paths, &executable, &cpaq::systemd::SystemRunner)?;
         println!("tokenmaxx: units applied");
-        return Ok(0);
-    }
-    if args.mode == Mode::Default && io::stdout().is_terminal() {
-        cpaq::tui::run(paths, config, args)?;
         return Ok(0);
     }
     let dir = paths.resolve_auth(args.auth_dir.as_deref(), config.auth_dir())?;

@@ -19,7 +19,8 @@ install -m755 target/release/cpaq ~/.local/bin/cpaq
 ## Usage
 
 ```sh
-cpaq                # TUI: Quotas | Tokenmaxx
+cpaq                # print the command list (same as --help)
+cpaq tui            # TUI: Quotas | Tokenmaxx
 cpaq quota          # headless quota report
 cpaq quota --json   # machine-readable output
 cpaq ping           # unconditional keep-alive pass
@@ -31,7 +32,8 @@ cpaq units apply    # save config and regenerate/enable the user units
 ```
 
 Keys: `q` quit · `Tab` switch tab · `j`/`k` move · `Enter` details/edit ·
-`r` refresh · `a` toggle auto (saved immediately) · `s` save and apply timer · `x` run now · `?` help.
+`r` refresh · `a` toggle auto (saved immediately) · `s` save and apply timer ·
+`p` ping now (one keep-alive pass) · `x` run now · `?` help.
 
 ## Configuration
 

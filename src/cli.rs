@@ -8,8 +8,8 @@ const ABOUT: &str = "CLIProxyAPI quotas and tokenmaxx keep-alive";
 
 const LONG_ABOUT: &str = "\
 Inspect CLIProxyAPI quotas, send tokenmaxx keep-alive pings, and read the
-tokenmaxx journal. Run without a command for the TUI when stdout is a terminal,
-otherwise for the quota report.";
+tokenmaxx journal. Every command works headless; run `cpaq tui` for the
+interactive terminal UI.";
 
 const AUTH_NOTES: &str = "\
 Auth discovery: --auth-dir > CPA_AUTH_DIR > config > XDG cli-proxy-api/auths > cpa/auths.
@@ -54,6 +54,7 @@ pub enum Mode {
     Auto,
     Log,
     Report,
+    Tui,
     UnitsApply,
     Quota,
     Ping,
@@ -186,6 +187,8 @@ enum Command {
         #[command(subcommand)]
         action: UnitsAction,
     },
+    /// Open the interactive terminal UI.
+    Tui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,6 +279,7 @@ impl From<Cli> for Args {
             Some(Command::Units {
                 action: UnitsAction::Apply,
             }) => args.mode = Mode::UnitsApply,
+            Some(Command::Tui) => args.mode = Mode::Tui,
             None => {
                 // No subcommand: the top-level flags decide between the default
                 // dispatch and the headless quota report.
@@ -283,7 +287,11 @@ impl From<Cli> for Args {
                 args.raw = cli.raw;
                 args.auth_dir = cli.auth_dir;
                 args.providers = providers(cli.provider, cli.providers);
-                args.mode = if args.json || args.raw || !args.providers.is_empty() {
+                args.mode = if args.json
+                    || args.raw
+                    || args.auth_dir.is_some()
+                    || !args.providers.is_empty()
+                {
                     Mode::Quota
                 } else {
                     Mode::Default
@@ -302,6 +310,10 @@ impl Args {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut argv: Vec<String> = vec!["cpaq".to_string()];
         argv.extend(args);
+        // Bare `cpaq` lists the commands instead of opening the TUI.
+        if argv.len() == 1 {
+            argv.push("--help".to_string());
+        }
         match Cli::try_parse_from(argv) {
             Ok(cli) => {
                 // clap accepts root flags and providers before a subcommand;
@@ -339,9 +351,13 @@ mod tests {
 
     #[test]
     fn top_level_flags_and_positional_providers() {
-        let args = parse(&[]).unwrap();
-        assert_eq!(args.mode, Mode::Default);
-        assert!(args.help_text.is_empty());
+        // A bare invocation lists the commands; no config or TTY needed.
+        let bare = parse(&[]).unwrap();
+        assert_eq!(bare.mode, Mode::Help);
+        for command in ["quota", "ping", "auto", "log", "report", "units", "tui"] {
+            assert!(bare.help_text.contains(command), "help lost {command}");
+        }
+        assert!(bare.help_text.contains("cpaq tui"));
 
         let args = parse(&["--json"]).unwrap();
         assert_eq!(args.mode, Mode::Quota);
@@ -351,9 +367,9 @@ mod tests {
         assert_eq!(args.mode, Mode::Quota);
         assert!(args.raw);
 
-        // An auth directory alone does not force the quota branch.
+        // Without an implicit TUI, an auth directory means the quota branch.
         let args = parse(&["--auth-dir", "auths"]).unwrap();
-        assert_eq!(args.mode, Mode::Default);
+        assert_eq!(args.mode, Mode::Quota);
         assert_eq!(args.auth_dir, Some(PathBuf::from("auths")));
 
         let args = parse(&["codex", "Claude"]).unwrap();
@@ -363,6 +379,18 @@ mod tests {
         let args = parse(&["-p", "CODEX", "--provider", "claude", "codex"]).unwrap();
         assert_eq!(args.mode, Mode::Quota);
         assert_eq!(args.providers, vec!["codex", "claude", "codex"]);
+    }
+
+    #[test]
+    fn tui_subcommand_opens_the_tui_with_its_own_help() {
+        let tui = parse(&["tui"]).unwrap();
+        assert_eq!(tui.mode, Mode::Tui);
+        let help = parse(&["tui", "--help"]).unwrap();
+        assert_eq!(help.mode, Mode::Help);
+        assert!(help.help_text.contains("interactive"));
+        // `help tui` renders the same page as `tui --help`.
+        assert_eq!(parse(&["help", "tui"]).unwrap().help_text, help.help_text);
+        assert!(parse(&["tui", "--json"]).is_err());
     }
 
     #[test]

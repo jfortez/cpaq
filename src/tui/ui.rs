@@ -136,7 +136,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let line = if app.status.is_empty() {
         Line::from(Span::styled(
-            "q quit · ? help · Tab tabs · j/k move · r refresh · a toggle auto · s save/apply · x run now",
+            "q quit · ? help · Tab tabs · j/k move · r refresh · a toggle auto · s save/apply · p ping · x run now",
             Style::default().fg(theme::MUTED),
         ))
     } else {
@@ -420,6 +420,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("r refresh quotas and timer status"),
         Line::raw("a toggle auto (saved immediately)"),
         Line::raw("s save & apply tokenmaxx units"),
+        Line::raw("p ping now (one keep-alive pass)"),
         Line::raw("x run now (systemctl --user start)"),
         Line::raw("? close this help"),
     ];
@@ -735,6 +736,15 @@ mod tests {
     }
 
     #[test]
+    fn footer_lists_ping_and_run_now() {
+        let app = app_with(Vec::new());
+        let text = render_text(&app, 120, 30);
+        assert!(text.contains("p ping"), "{text}");
+        assert!(text.contains("x run now"), "{text}");
+        assert!(text.contains("s save/apply"), "{text}");
+    }
+
+    #[test]
     fn help_overlay_lists_the_spec_keys() {
         let mut app = app_with(Vec::new());
         app.overlay = Overlay::Help;
@@ -742,6 +752,7 @@ mod tests {
         assert!(text.contains("Help"));
         assert!(text.contains("q quit"));
         assert!(text.contains("s save & apply"));
+        assert!(text.contains("p ping now (one keep-alive pass)"));
         assert!(text.contains("x run now"));
     }
 
